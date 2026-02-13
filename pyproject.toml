@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "doin-plugins"
+version = "0.1.0"
+description = "Reference plugins for the Decentralized Optimization Network (DON)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Harvey" },
+]
+dependencies = [
+    "doin-core>=0.1.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-asyncio>=0.21",
+]
+
+# Entry points — this is how DON discovers plugins
+[project.entry-points."doin.optimization"]
+simple_quadratic = "doin_plugins.quadratic_optimizer:QuadraticOptimizer"
+predictor = "doin_plugins.predictor.optimizer:PredictorOptimizer"
+
+[project.entry-points."doin.inference"]
+simple_quadratic = "doin_plugins.quadratic_inferencer:QuadraticInferencer"
+predictor = "doin_plugins.predictor.inferencer:PredictorInferencer"
+
+[project.entry-points."doin.synthetic_data"]
+simple_quadratic = "doin_plugins.quadratic_synthetic:QuadraticSyntheticData"
+predictor = "doin_plugins.predictor.synthetic:PredictorSyntheticData"
+
+[project.urls]
+Homepage = "https://github.com/harveybc/doin-plugins"
+Repository = "https://github.com/harveybc/doin-plugins"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
