@@ -1,56 +1,55 @@
-# DON Plugins
+# doin-plugins
 
-**Reference plugins for the Decentralized Optimization Network (DON)**
-
-Provides a simple quadratic optimization domain for testing and demonstrating the full DON pipeline without ML dependencies.
+Domain plugins for DOIN (Decentralized Optimization and Inference Network).
 
 ## Included Plugins
 
-### Quadratic Optimizer (`simple_quadratic`)
-Hill-climbing optimizer that minimizes `f(x) = Σ(x_i - target_i)²`. Uses random perturbations to explore the parameter space.
+### Quadratic (Reference)
+Simple quadratic function optimization — no ML frameworks needed. Used for testing the full DOIN pipeline.
 
-### Quadratic Inferencer (`simple_quadratic`)
-Evaluates parameters against the quadratic function. Returns negative MSE as the performance metric (higher is better).
+- **Optimizer**: Hill-climbing on `f(x) = Σ(x_i - target_i)²`
+- **Inferencer**: Evaluates parameters against target
+- **Synthetic Data**: Generates noisy target variants for verification
 
-### Quadratic Synthetic Data (`simple_quadratic`)
-Generates noisy versions of the target for evaluator verification, preventing overfitting to exact validation data.
+### Predictor (ML)
+Wraps [harveybc/predictor](https://github.com/harveybc/predictor) timeseries prediction system. Requires TensorFlow.
 
-## Installation
+- **Optimizer**: Runs predictor training with genetic algorithm
+- **Inferencer**: Evaluates model on test/synthetic data
+- **Synthetic Data**: Wraps [harveybc/timeseries-gan](https://github.com/harveybc/timeseries-gan) (SC-VAE-GAN) with block bootstrap fallback
+
+## Entry Points
+
+```
+doin.optimization/quadratic → QuadraticOptimizer
+doin.optimization/predictor → PredictorOptimizer
+doin.inference/quadratic → QuadraticInferencer
+doin.inference/predictor → PredictorInferencer
+doin.synthetic_data/quadratic → QuadraticSyntheticData
+doin.synthetic_data/predictor → PredictorSyntheticData
+```
+
+## Install
 
 ```bash
-pip install -e ".[dev]"
+pip install git+https://github.com/harveybc/doin-core.git
+pip install git+https://github.com/harveybc/doin-plugins.git
 ```
 
-Requires `doin-core` to be installed first.
-
-## Usage
-
-These plugins are registered via setuptools entry points. Once installed, DON components discover them automatically:
-
-```python
-from doin_core.plugins.loader import load_optimization_plugin
-
-OptCls = load_optimization_plugin("simple_quadratic")
-optimizer = OptCls()
-optimizer.configure({"n_params": 5, "target": [1, 2, 3, 4, 5], "step_size": 0.5})
-params, performance = optimizer.optimize(None, None)
-```
-
-## Integration Test
-
-The integration test (`tests/test_integration.py`) runs the **complete DON pipeline**:
-
-1. Optimizer produces improving parameters
-2. Evaluator verifies reported performance
-3. Validator accepts/rejects based on tolerance
-4. Consensus tracks weighted performance increments
-5. Block is generated when threshold is met
-6. Chain grows with multiple blocks
+## Tests
 
 ```bash
-pytest tests/test_integration.py -v -s
+python -m pytest tests/ -v
+# 43 tests (including end-to-end lifecycle)
 ```
 
-## License
+### Key Tests
+- `test_e2e_lifecycle.py` — Full optimae lifecycle: optimize → commit → reveal → quorum → verify → incentive → reputation (7 tests)
+- `test_plugins.py` — Quadratic plugin unit tests
+- `test_network_integration.py` — Multi-component integration
 
-MIT
+## Part of DOIN
+
+- [doin-core](https://github.com/harveybc/doin-core) — Consensus, models, crypto
+- [doin-node](https://github.com/harveybc/doin-node) — Unified node
+- [doin-plugins](https://github.com/harveybc/doin-plugins) — This package
