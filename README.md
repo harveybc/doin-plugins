@@ -40,7 +40,7 @@ pip install git+https://github.com/harveybc/doin-plugins.git
 
 ```bash
 python -m pytest tests/ -v
-# 43 tests (including end-to-end lifecycle)
+# 43 tests (7 e2e lifecycle + unit + integration)
 ```
 
 ### Key Tests
