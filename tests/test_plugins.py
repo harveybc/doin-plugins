@@ -81,8 +81,16 @@ class TestQuadraticSyntheticData:
         diff = np.abs(np.array(data["target"]) - np.array(TARGET))
         assert np.all(diff < 0.1)  # Very close with low noise
 
-    def test_no_target_raises(self) -> None:
+    def test_no_target_generates_from_seed(self) -> None:
+        """Without explicit target, generates deterministic data from seed."""
         gen = QuadraticSyntheticData()
-        gen.configure({})
-        with pytest.raises(ValueError, match="No target"):
-            gen.generate()
+        gen.configure({"n_params": 5})
+        data = gen.generate(seed=42)
+        assert len(data["target"]) == 5
+        assert data["synthetic"] is True
+        # Same seed → same data
+        data2 = gen.generate(seed=42)
+        assert data["target"] == data2["target"]
+        # Different seed → different data
+        data3 = gen.generate(seed=99)
+        assert data["target"] != data3["target"]
