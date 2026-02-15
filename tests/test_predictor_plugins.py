@@ -125,6 +125,70 @@ class TestPredictorInferencer:
         assert issubclass(PredictorInferencer, InferencePlugin)
 
 
+class TestPredictorSyntheticData:
+    """Tests for PredictorSyntheticData (synthetic-datagen integration)."""
+
+    def test_interface_compliance(self):
+        """PredictorSyntheticData implements SyntheticDataPlugin."""
+        from doin_core.plugins.base import SyntheticDataPlugin
+        from doin_plugins.predictor.synthetic import PredictorSyntheticData
+        assert issubclass(PredictorSyntheticData, SyntheticDataPlugin)
+
+    def test_bootstrap_fallback_deterministic(self):
+        """Bootstrap fallback produces identical output for same seed."""
+        from doin_plugins.predictor.synthetic import PredictorSyntheticData
+
+        plugin = PredictorSyntheticData()
+        plugin._method = "bootstrap"
+        plugin._n_samples = 100
+        plugin._block_size = 20
+        plugin._noise_scale = 0.05
+
+        # Create fake real data
+        import pandas as pd
+        n = 500
+        fake_prices = np.cumsum(np.random.randn(n) * 0.001) + 1.3
+        plugin._real_data = {
+            "train": pd.DataFrame({"typical_price": fake_prices}),
+        }
+
+        result1 = plugin._generate_bootstrap(seed=12345)
+        result2 = plugin._generate_bootstrap(seed=12345)
+
+        assert result1["data_hash"] == result2["data_hash"]
+        assert result1["n_samples"] == 100
+        assert result1["method"] == "bootstrap"
+
+        # Different seed → different data
+        result3 = plugin._generate_bootstrap(seed=99999)
+        assert result3["data_hash"] != result1["data_hash"]
+
+    def test_generate_returns_required_fields(self):
+        """generate() returns all required dict fields."""
+        from doin_plugins.predictor.synthetic import PredictorSyntheticData
+
+        plugin = PredictorSyntheticData()
+        plugin._method = "bootstrap"
+        plugin._n_samples = 50
+        plugin._block_size = 10
+        plugin._noise_scale = 0.01
+
+        import pandas as pd
+        plugin._real_data = {
+            "train": pd.DataFrame({"typical_price": np.ones(200) * 1.3}),
+        }
+
+        result = plugin.generate(seed=42)
+        assert "synthetic_df" in result
+        assert "synthetic_csv" in result
+        assert "data_hash" in result
+        assert "n_samples" in result
+        assert "method" in result
+        assert "seed" in result
+        assert isinstance(result["synthetic_df"], pd.DataFrame)
+        assert "typical_price" in result["synthetic_df"].columns
+
+
 class TestFitnessConvention:
     """Verify the DON ↔ predictor performance sign convention."""
 
