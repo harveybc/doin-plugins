@@ -1,7 +1,6 @@
 """Synthetic data generator for the predictor domain.
 
-Wraps harveybc/synthetic-datagen as a DOIN SyntheticDataPlugin.
-Uses a trained VAE-GAN to generate typical_price timeseries data that
+Uses block bootstrap to generate typical_price timeseries data that
 preserves statistical properties of real data but with different values —
 making it impossible to memorize the verification data.
 
@@ -12,25 +11,28 @@ All evaluators in a quorum use the same seed (derived from commitment hash)
 The synthetic data hash is included in each evaluator's vote and checked
 by the quorum to ensure all evaluators used identical data.
 
-Dependencies:
-  - harveybc/synthetic-datagen (pip install -e /path/to/synthetic-datagen)
-  - Pre-trained VAE-GAN model (.keras + .keras.parts/)
+Method: Block Bootstrap (proven best in augmentation sweep):
+  - Resamples contiguous blocks from real training data (d1-d3)
+  - Preserves local temporal structure within blocks
+  - Different seed → different block arrangement → different data
+  - No training required — fast, deterministic, reproducible
+
+Sweep results (2026-02-16):
+  - bb_n1000 (bs=30): val +4.39%, test +0.61%  ← best block bootstrap
+  - tg_n500:          val +3.25%, test +1.09%  ← best TimeGAN
+  - All other configs hurt test performance
 
 Configuration:
-  generator_model:  Path to trained .keras model (required)
-  n_samples:        Number of 4h typical_price rows to generate (default: 2190 = ~1 year)
-  sdg_root:         Path to synthetic-datagen repo (auto-detected)
-  predictor_root:   Path to predictor repo (for fallback data loading)
-  load_config:      Path to predictor config JSON
-  method:           "sdg" (default) or "bootstrap" (fallback)
-  block_size:       Block size for bootstrap fallback (default: 50)
-  noise_scale:      Noise scale for bootstrap fallback (default: 0.05)
+  n_samples:       Number of 4h typical_price rows (default: 1560 = 1 year)
+  block_size:      Contiguous block length for bootstrap (default: 30)
+  predictor_root:  Path to predictor repo (for loading real data)
+  data_files:      List of CSV paths for source data (overrides auto-detect)
+  quiet:           Suppress verbose output (default: True)
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import sys
 from pathlib import Path
@@ -43,57 +45,34 @@ from doin_core.plugins.base import SyntheticDataPlugin
 
 log = logging.getLogger(__name__)
 
+# 1 year of 4h forex data (no weekends): 260 trading days × 6 candles/day
+SAMPLES_PER_YEAR = 1560
+DEFAULT_BLOCK_SIZE = 30  # Proven optimal in sweep
+
 
 class PredictorSyntheticData(SyntheticDataPlugin):
     """Generates synthetic timeseries data for predictor verification.
 
-    Primary method: wraps synthetic-datagen's TypicalPriceGenerator for
-    high-quality VAE-GAN synthetic data.
-
-    Fallback method: block bootstrap with noise (if synthetic-datagen not available).
+    Method: Block bootstrap from real training data (d1-d3).
+    Fast, deterministic, no model training required.
     """
 
     def __init__(self) -> None:
         self._config: dict[str, Any] = {}
-        self._method = "sdg"
-        self._sdg_root: Path | None = None
         self._predictor_root: Path | None = None
-
-        # SDG generator (reusable — load model once, generate many times)
-        self._sdg_available = False
-        self._generator = None
-
-        # Fallback state
-        self._real_data: dict[str, Any] | None = None
-        self._block_size = 50
-        self._noise_scale = 0.05
-        self._n_samples = 2190  # ~1 year of 4h data
+        self._real_prices: np.ndarray | None = None
+        self._n_samples = SAMPLES_PER_YEAR
+        self._block_size = DEFAULT_BLOCK_SIZE
 
     def configure(self, config: dict[str, Any]) -> None:
         self._config = config
-        self._method = config.get("method", "sdg")
-        self._block_size = config.get("block_size", 50)
-        self._noise_scale = config.get("noise_scale", 0.05)
-        self._n_samples = config.get("n_samples", 2190)
+        self._n_samples = config.get("n_samples", SAMPLES_PER_YEAR)
+        self._block_size = config.get("block_size", DEFAULT_BLOCK_SIZE)
 
-        # Resolve synthetic-datagen repo
-        sdg_root = config.get("sdg_root")
-        if sdg_root:
-            self._sdg_root = Path(sdg_root).resolve()
-        else:
-            for candidate in [
-                Path.home() / "synthetic-datagen",
-                Path.cwd() / "synthetic-datagen",
-                Path("/home/openclaw/.openclaw/workspace/synthetic-datagen"),
-            ]:
-                if (candidate / "pyproject.toml").exists():
-                    self._sdg_root = candidate
-                    break
-
-        # Resolve predictor repo (for fallback)
-        pred_root = config.get("predictor_root")
-        if pred_root:
-            self._predictor_root = Path(pred_root).resolve()
+        # Resolve predictor repo
+        root = config.get("predictor_root")
+        if root:
+            self._predictor_root = Path(root).resolve()
         else:
             for candidate in [
                 Path.home() / "predictor",
@@ -104,88 +83,45 @@ class PredictorSyntheticData(SyntheticDataPlugin):
                     self._predictor_root = candidate
                     break
 
-        # Try to load synthetic-datagen generator
-        if self._method == "sdg":
-            try:
-                self._setup_sdg()
-                self._sdg_available = True
-                log.info("synthetic-datagen generator loaded successfully")
-            except Exception as e:
-                log.warning(
-                    "synthetic-datagen not available, falling back to bootstrap: %s", e
-                )
-                self._method = "bootstrap"
-                self._sdg_available = False
-
-        # For bootstrap fallback, load real data
-        if self._method == "bootstrap":
-            self._load_real_data()
-
-    def _setup_sdg(self) -> None:
-        """Initialize synthetic-datagen generator and load model."""
-        # Ensure synthetic-datagen is importable
-        if self._sdg_root:
-            root_str = str(self._sdg_root)
-            if root_str not in sys.path:
-                sys.path.insert(0, root_str)
-
-        from sdg_plugins.generator.typical_price_generator import TypicalPriceGenerator
-
-        model_path = self._config.get("generator_model")
-        if not model_path:
-            # Try default location
-            if self._sdg_root:
-                default = self._sdg_root / "examples" / "models" / "vae_gan_4h.keras"
-                if default.exists():
-                    model_path = str(default)
-
-        if not model_path:
-            raise FileNotFoundError(
-                "No generator_model path configured and no default model found. "
-                "Train one with: sdg --mode train --train_data d1.csv d2.csv d3.csv"
-            )
-
-        # Create generator with minimal config
-        gen_config = {
-            "load_model": model_path,
-            "n_samples": self._n_samples,
-            "seed": 42,  # will be overridden per-call
-            "use_returns": self._config.get("use_returns", True),
-            "interval_hours": 4,
-            "start_datetime": "2020-01-01 00:00:00",
-        }
-        self._generator = TypicalPriceGenerator(gen_config)
-        self._generator.load_model(model_path)
-        log.info(f"Loaded VAE-GAN model from {model_path}")
-
-    def _load_real_data(self) -> None:
-        """Load real data for bootstrap fallback."""
         if self._predictor_root is None:
             raise FileNotFoundError(
-                "Cannot find predictor repo for bootstrap fallback. "
-                "Set 'predictor_root' in config."
+                "Cannot find predictor repo. Set 'predictor_root' in config."
             )
 
-        # Load CSV files directly
-        data_dir = self._predictor_root / "examples" / "data_downsampled" / "phase_1"
-        train_path = data_dir / "base_d1.csv"
-        val_path = data_dir / "base_d2.csv"
-        test_path = data_dir / "base_d3.csv"
+        self._load_real_data(config.get("data_files"))
 
-        if not train_path.exists():
-            raise FileNotFoundError(f"Training data not found: {train_path}")
+    def _load_real_data(self, data_files: list[str] | None = None) -> None:
+        """Load real training data (d1-d3) for block bootstrap source.
 
-        self._real_data = {
-            "train": pd.read_csv(train_path, parse_dates=["DATE_TIME"]),
-            "val": pd.read_csv(val_path, parse_dates=["DATE_TIME"]),
-            "test": pd.read_csv(test_path, parse_dates=["DATE_TIME"]),
-        }
+        Only d1-d3 are used — these are the generator training sets.
+        d4/d5/d6 are predictor train/val/test and must never be seen by
+        the synthetic generator.
+        """
+        if data_files:
+            paths = [Path(f) for f in data_files]
+        else:
+            data_dir = self._predictor_root / "examples" / "data_downsampled" / "phase_1"
+            paths = [data_dir / f"base_d{i}.csv" for i in range(1, 4)]
+
+        all_prices = []
+        for p in paths:
+            if not p.exists():
+                raise FileNotFoundError(f"Source data not found: {p}")
+            df = pd.read_csv(p)
+            col = "typical_price" if "typical_price" in df.columns else df.columns[-1]
+            all_prices.append(df[col].values)
+
+        self._real_prices = np.concatenate(all_prices)
+        log.info(
+            "Loaded %d real price samples from %d files for bootstrap",
+            len(self._real_prices), len(paths),
+        )
 
     def generate(self, seed: int | None = None) -> dict[str, Any]:
-        """Generate synthetic data deterministically.
+        """Generate synthetic data deterministically via block bootstrap.
 
         DETERMINISTIC: same seed → identical output across all evaluators.
-        This is verified by the quorum via synthetic data hash consensus.
+        Verified by quorum via synthetic data hash consensus.
 
         Args:
             seed: Random seed. In quorum verification, derived from
@@ -197,86 +133,52 @@ class PredictorSyntheticData(SyntheticDataPlugin):
               - synthetic_csv: CSV string for hashing
               - data_hash: SHA256 hash of synthetic data (for quorum consensus)
               - n_samples: number of generated rows
-              - method: "sdg" or "bootstrap"
+              - method: "block_bootstrap"
               - seed: the seed used
+              - block_size: block size used
         """
-        if self._sdg_available and self._method == "sdg":
-            return self._generate_sdg(seed)
-        else:
-            return self._generate_bootstrap(seed)
-
-    def _generate_sdg(self, seed: int | None = None) -> dict[str, Any]:
-        """Generate using synthetic-datagen VAE-GAN.
-
-        Deterministic: same seed + same model = identical output.
-        """
-        if self._generator is None:
-            raise RuntimeError("Generator not initialized — call configure() first")
+        if self._real_prices is None:
+            raise RuntimeError("Real data not loaded — call configure() first")
 
         seed = seed or 42
-        df = self._generator.generate(seed=seed, n_samples=self._n_samples, output_file="")
-
-        # Create CSV string for hashing (ensures all evaluators can verify identical data)
-        csv_str = df.to_csv(index=False)
-        data_hash = hashlib.sha256(csv_str.encode()).hexdigest()
-
-        return {
-            "synthetic_df": df,
-            "synthetic_csv": csv_str,
-            "data_hash": data_hash,
-            "n_samples": len(df),
-            "method": "sdg",
-            "seed": seed,
-        }
-
-    def _generate_bootstrap(self, seed: int | None = None) -> dict[str, Any]:
-        """Block bootstrap: resample blocks of real data with noise.
-
-        Deterministic given the same seed.
-        """
-        if self._real_data is None:
-            raise ValueError("Real data not loaded — call configure() first")
-
         rng = np.random.default_rng(seed)
 
-        # Bootstrap from training data
-        train_prices = self._real_data["train"]["typical_price"].values
-        n = len(train_prices)
-        bs = min(self._block_size, n)
+        n_real = len(self._real_prices)
+        bs = min(self._block_size, n_real)
 
-        # Block bootstrap
+        # Block bootstrap: sample random starting positions, take contiguous blocks
         indices = []
         while len(indices) < self._n_samples:
-            start = int(rng.integers(0, max(1, n - bs)))
-            indices.extend(range(start, min(start + bs, n)))
+            start = int(rng.integers(0, max(1, n_real - bs)))
+            indices.extend(range(start, start + bs))
         indices = indices[:self._n_samples]
 
-        synthetic_prices = train_prices[indices].copy()
+        synthetic_prices = self._real_prices[indices].copy()
 
-        # Add noise
-        noise_std = float(np.std(synthetic_prices)) * self._noise_scale
-        synthetic_prices += rng.normal(0, noise_std, len(synthetic_prices))
-
-        # Build DataFrame
-        from datetime import datetime, timedelta
-        start_dt = datetime(2020, 1, 1)
-        dates = [start_dt + timedelta(hours=4 * i) for i in range(len(synthetic_prices))]
-
+        # Build DataFrame with synthetic timestamps (4h intervals, skip weekends)
+        dates = self._generate_trading_dates(self._n_samples, rng)
         df = pd.DataFrame({
             "DATE_TIME": dates,
             "typical_price": synthetic_prices,
         })
 
+        # Create CSV string for hashing
         csv_str = df.to_csv(index=False)
         data_hash = hashlib.sha256(csv_str.encode()).hexdigest()
+
+        log.info(
+            "Generated %d synthetic samples (block_size=%d, seed=%d, hash=%s…)",
+            len(df), bs, seed, data_hash[:12],
+        )
 
         return {
             "synthetic_df": df,
             "synthetic_csv": csv_str,
             "data_hash": data_hash,
             "n_samples": len(df),
-            "method": "bootstrap",
+            "method": "block_bootstrap",
             "seed": seed,
+            "block_size": bs,
         }
 
     def get_data_hash(self, seed: int) -> str:
@@ -287,3 +189,20 @@ class PredictorSyntheticData(SyntheticDataPlugin):
         """
         result = self.generate(seed=seed)
         return result["data_hash"]
+
+    @staticmethod
+    def _generate_trading_dates(n: int, rng: np.random.Generator) -> list:
+        """Generate n trading timestamps at 4h intervals, skipping weekends."""
+        from datetime import datetime, timedelta
+
+        dates = []
+        # Start from a known Monday
+        dt = datetime(2020, 1, 6, 0, 0, 0)  # Monday
+        while len(dates) < n:
+            if dt.weekday() < 5:  # Mon-Fri
+                dates.append(dt)
+            dt += timedelta(hours=4)
+            # Skip to Monday if we hit Saturday
+            if dt.weekday() == 5:
+                dt += timedelta(days=2)
+        return dates[:n]

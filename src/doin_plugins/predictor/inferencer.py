@@ -85,6 +85,8 @@ class PredictorInferencer(InferencePlugin):
                 self._predictor_config[key] = self._config[key]
 
         self._predictor_config["disable_postfit_uncertainty"] = True
+        # Quiet mode: suppress verbose predictor output by default
+        self._predictor_config.setdefault("quiet", True)
 
     def _load_plugins(self) -> None:
         from app.plugin_loader import load_plugin
@@ -122,6 +124,21 @@ class PredictorInferencer(InferencePlugin):
         Returns:
             Performance metric (negated fitness — higher = better).
         """
+        import builtins
+        import os
+
+        # Suppress noisy predictor prints in quiet mode
+        if self._predictor_config.get("quiet", True):
+            os.environ["PREDICTOR_QUIET"] = "1"
+            os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+            _orig_print = builtins.print
+            def _quiet_print(*args, **kwargs):
+                if args:
+                    msg = str(args[0]).upper()
+                    if any(k in msg for k in ["ERROR", "WARN", "EXCEPTION", "FATAL"]):
+                        _orig_print(*args, **kwargs)
+            builtins.print = _quiet_print
+
         try:
             import tensorflow as tf
         except ImportError:
