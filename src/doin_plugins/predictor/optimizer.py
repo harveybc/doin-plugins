@@ -231,13 +231,16 @@ class PredictorOptimizer(OptimizationPlugin):
         # Build config for predictor optimizer
         opt_config = copy.deepcopy(self._predictor_config)
 
-        # Inject DOIN callbacks
+        # Inject DOIN callbacks (non-serializable — stored separately)
+        # The predictor optimizer reads these before any JSON serialization
         opt_config["optimization_callbacks"] = {
             "on_generation_start": self._on_generation_start,
             "on_new_champion": self._on_new_champion,
             "on_between_candidates": self._on_between_candidates,
             "on_generation_end": self._on_generation_end,
         }
+        # Mark callbacks as non-serializable so predictor skips them in JSON dumps
+        opt_config["_non_serializable_keys"] = {"optimization_callbacks"}
 
         # If we have a network champion, inject it as the starting point
         if current_best_params:
