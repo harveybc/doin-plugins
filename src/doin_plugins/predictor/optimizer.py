@@ -280,7 +280,7 @@ class PredictorOptimizer(OptimizationPlugin):
 
         # Get final champion fitness from the optimizer
         fitness = getattr(self._deap_optimizer, "best_fitness_so_far", float("inf"))
-        performance = -fitness  # DOIN convention: higher = better
+        performance = fitness  # Raw fitness; unified node uses higher_is_better to compare
 
         return best_hyper, performance
 
