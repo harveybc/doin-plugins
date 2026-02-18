@@ -1,16 +1,19 @@
 """DON Inference Plugin for harveybc/predictor.
 
 Used by DON evaluators to verify optimizer-reported performance.
-Loads the predictor model with given hyperparameters, trains it,
-and independently computes the fitness to confirm the claimed metric.
+Loads the trained model shared by the optimizer, generates synthetic data,
+and runs INFERENCE ONLY (no training) to verify the claimed metric.
 """
 
 from __future__ import annotations
 
+import base64
 import copy
 import gc
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -22,22 +25,25 @@ from doin_core.plugins.base import InferencePlugin
 class PredictorInferencer(InferencePlugin):
     """Evaluates predictor model performance for DON verification.
 
-    Same config structure as PredictorOptimizer — both need access
-    to the predictor repo and its plugin stack.
+    The optimizer shares its trained model (base64-encoded .keras file)
+    along with the hyperparameters. The evaluator:
+    1. Generates synthetic data (unique per-evaluator seed)
+    2. Preprocesses it through the same pipeline
+    3. Loads the trained model
+    4. Runs model.predict() (inference only — NO training)
+    5. Computes fitness metric independently
     """
 
     def __init__(self) -> None:
         self._config: dict[str, Any] = {}
         self._predictor_config: dict[str, Any] = {}
         self._predictor_root: Path | None = None
-        self._predictor_plugin: Any = None
         self._preprocessor_plugin: Any = None
         self._target_plugin: Any = None
 
     def configure(self, config: dict[str, Any]) -> None:
         self._config = config
 
-        # Resolve predictor repo
         root = config.get("predictor_root")
         if root:
             self._predictor_root = Path(root).resolve()
@@ -85,16 +91,10 @@ class PredictorInferencer(InferencePlugin):
                 self._predictor_config[key] = self._config[key]
 
         self._predictor_config["disable_postfit_uncertainty"] = True
-        # Quiet mode: suppress verbose predictor output by default
         self._predictor_config.setdefault("quiet", True)
 
     def _load_plugins(self) -> None:
         from app.plugin_loader import load_plugin
-
-        pred_name = self._predictor_config.get("predictor_plugin", "default_predictor")
-        pred_cls, _ = load_plugin("predictor.plugins", pred_name)
-        self._predictor_plugin = pred_cls(self._predictor_config)
-        self._predictor_plugin.set_params(**self._predictor_config)
 
         pre_name = self._predictor_config.get("preprocessor_plugin", "default_preprocessor")
         pre_cls, _ = load_plugin("preprocessor.plugins", pre_name)
@@ -111,99 +111,73 @@ class PredictorInferencer(InferencePlugin):
         parameters: dict[str, Any],
         data: dict[str, Any] | None = None,
     ) -> float:
-        """Evaluate model with given hyperparameters.
+        """Evaluate model via INFERENCE ONLY using the optimizer's trained model.
 
-        Trains from scratch with the given params and computes the
-        fitness metric independently to verify optimizer claims.
+        The optimizer includes '_model_b64' (base64-encoded .keras file) in
+        the parameters. We decode it, load the model, run predict() on
+        synthetic data, and compute fitness.
 
         Args:
-            parameters: Hyperparameters from the optimae.
-            data: Optional synthetic data dict. If None, uses configured
-                  train/val files from predictor config.
+            parameters: Hyperparameters + _model_b64 from the optimae.
+            data: Synthetic data dict from DOIN evaluator verification.
 
         Returns:
             Performance metric (negated fitness — higher = better).
         """
         import builtins
-        import os
 
-        # Suppress noisy predictor prints in quiet mode
         if self._predictor_config.get("quiet", True):
             os.environ["PREDICTOR_QUIET"] = "1"
             os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-            _orig_print = builtins.print
-            def _quiet_print(*args, **kwargs):
-                if args:
-                    msg = str(args[0]).upper()
-                    if any(k in msg for k in ["ERROR", "WARN", "EXCEPTION", "FATAL"]):
-                        _orig_print(*args, **kwargs)
-            builtins.print = _quiet_print
 
         try:
             import tensorflow as tf
         except ImportError:
             tf = None
 
-        # Clean slate
-        if hasattr(self._predictor_plugin, "model"):
-            del self._predictor_plugin.model
-        if tf:
-            tf.keras.backend.clear_session()
-        gc.collect()
+        # Extract trained model
+        model_b64 = parameters.pop("_model_b64", None)
+        if model_b64 is None:
+            # No model provided — can't verify without it
+            return float("-inf")  # Worst possible score
 
-        # Build eval config with the claimed hyperparams
+        # Build eval config with claimed hyperparams
         eval_config = copy.deepcopy(self._predictor_config)
-        eval_config.update(parameters)
+        # Don't put non-config keys in eval_config
+        clean_params = {k: v for k, v in parameters.items() if not k.startswith("_")}
+        eval_config.update(clean_params)
         eval_config["disable_postfit_uncertainty"] = True
         eval_config["mc_samples"] = 1
 
         # Special param handling (must match optimizer's conventions)
         ACTIVATIONS = ["relu", "elu", "selu", "tanh", "sigmoid", "swish", "gelu", "linear"]
-        if "activation" in parameters:
-            idx = int(round(parameters["activation"])) % len(ACTIVATIONS)
+        if "activation" in clean_params:
+            idx = int(round(clean_params["activation"])) % len(ACTIVATIONS)
             eval_config["activation"] = ACTIVATIONS[idx]
-        if "positional_encoding" in parameters:
-            eval_config["positional_encoding"] = bool(int(round(parameters["positional_encoding"])))
-        if "use_log1p_features" in parameters:
-            val = parameters["use_log1p_features"]
-            if not isinstance(val, list):
-                eval_config["use_log1p_features"] = (
-                    ["typical_price"] if int(round(val)) == 1 else None
-                )
-        # Ensure integer params are ints
+        if "positional_encoding" in clean_params:
+            eval_config["positional_encoding"] = bool(int(round(clean_params["positional_encoding"])))
         for int_param in ["window_size", "encoder_conv_layers", "encoder_base_filters",
                           "encoder_lstm_units", "horizon_attn_heads", "horizon_attn_key_dim",
                           "horizon_embedding_dim", "batch_size", "early_patience", "kl_anneal_epochs"]:
             if int_param in eval_config and isinstance(eval_config[int_param], float):
                 eval_config[int_param] = int(round(eval_config[int_param]))
 
-        # Preprocess — use synthetic data if provided, else standard files
+        # Preprocess synthetic data for inference
         if data is not None and "synthetic_df" in data:
-            # Synthetic data from DOIN evaluator verification.
-            # The synthetic plugin generates a complete price series.
-            # We preprocess it through the same pipeline the optimizer uses,
-            # splitting into train/val so the model can be trained and
-            # its generalization independently verified.
-            import tempfile, os
             synth_df = data["synthetic_df"]
             n = len(synth_df)
-            # Same split ratios as real data pipeline (60/20/20)
             i_train = int(n * 0.6)
             i_val = int(n * 0.8)
             train_df = synth_df.iloc[:i_train]
             val_df = synth_df.iloc[i_train:i_val]
             test_df = synth_df.iloc[i_val:]
             with tempfile.TemporaryDirectory() as tmpdir:
-                train_path = os.path.join(tmpdir, "train.csv")
-                val_path = os.path.join(tmpdir, "val.csv")
-                test_path = os.path.join(tmpdir, "test.csv")
-                train_df.to_csv(train_path, index=False)
-                val_df.to_csv(val_path, index=False)
-                test_df.to_csv(test_path, index=False)
+                for name, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
+                    df.to_csv(os.path.join(tmpdir, f"{name}.csv"), index=False)
                 synth_config = copy.deepcopy(eval_config)
-                synth_config["training_file"] = train_path
-                synth_config["validation_file"] = val_path
-                synth_config["testing_file"] = test_path
+                synth_config["training_file"] = os.path.join(tmpdir, "train.csv")
+                synth_config["validation_file"] = os.path.join(tmpdir, "val.csv")
+                synth_config["testing_file"] = os.path.join(tmpdir, "test.csv")
                 datasets = self._preprocessor_plugin.run_preprocessing(
                     self._target_plugin, synth_config
                 )
@@ -218,38 +192,31 @@ class PredictorInferencer(InferencePlugin):
             if isinstance(datasets, tuple):
                 datasets = datasets[0]
 
-        x_train = datasets["x_train"]
-        y_train = self._ensure_2d(datasets["y_train"])
         x_val = datasets["x_val"]
         y_val = self._ensure_2d(datasets["y_val"])
         baseline_val = datasets.get("baseline_val")
 
-        # Build & train
-        window_size = eval_config.get("window_size")
-        plugin_name = eval_config.get("plugin", "ann")
-        if plugin_name in ["lstm", "cnn", "transformer", "ann", "mimo", "n_beats", "tft"]:
-            input_shape = (
-                (window_size, x_train.shape[2]) if len(x_train.shape) == 3
-                else (x_train.shape[1],)
-            )
-        else:
-            input_shape = (x_train.shape[1],)
+        # Load the trained model from base64 — INFERENCE ONLY
+        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as tmp:
+            tmp.write(base64.b64decode(model_b64))
+            tmp_model_path = tmp.name
 
-        self._predictor_plugin.set_params(**eval_config)
-        self._predictor_plugin.build_model(
-            input_shape=input_shape, x_train=x_train, config=eval_config,
-        )
+        try:
+            model = tf.keras.models.load_model(tmp_model_path, compile=False)
 
-        history, train_preds, _, val_preds, _ = self._predictor_plugin.train(
-            x_train, y_train,
-            epochs=eval_config.get("epochs", 10),
-            batch_size=eval_config.get("batch_size", 32),
-            threshold_error=eval_config.get("threshold_error", 0.001),
-            x_val=x_val, y_val=y_val, config=eval_config,
-        )
+            # Run inference
+            pred_bs = int(eval_config.get("batch_size", 32))
+            val_preds = model.predict(x_val, batch_size=pred_bs, verbose=0)
+            val_preds = [val_preds] if isinstance(val_preds, np.ndarray) else val_preds
 
-        # Compute fitness
-        fitness = self._compute_fitness(val_preds, y_val, baseline_val, eval_config)
+            # Compute fitness
+            fitness = self._compute_fitness(val_preds, y_val, baseline_val, eval_config)
+        finally:
+            # Cleanup
+            os.unlink(tmp_model_path)
+            if tf:
+                tf.keras.backend.clear_session()
+            gc.collect()
 
         # Return DON performance (higher = better)
         return -fitness
