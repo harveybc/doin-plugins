@@ -228,6 +228,11 @@ class PredictorOptimizer(OptimizationPlugin):
         os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
         os.environ.setdefault("PREDICTOR_QUIET", "1")
 
+        # Change to predictor root so relative paths in config work
+        # (subprocess worker inherits cwd for data file resolution)
+        if self._predictor_root:
+            os.chdir(str(self._predictor_root))
+
         # Build config for predictor optimizer
         opt_config = copy.deepcopy(self._predictor_config)
 
