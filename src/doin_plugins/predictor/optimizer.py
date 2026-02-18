@@ -141,6 +141,7 @@ class PredictorOptimizer(OptimizationPlugin):
 
         # Force optimizer-friendly settings
         self._predictor_config["disable_postfit_uncertainty"] = True
+        self._predictor_config.setdefault("quiet", True)
 
     def _load_plugins(self) -> None:
         """Load predictor's plugins via its entry point system."""
@@ -174,7 +175,12 @@ class PredictorOptimizer(OptimizationPlugin):
         DON convention: higher performance = better.
         Predictor convention: lower fitness = better.
         We negate: DON performance = -predictor_fitness.
+
+        After calling this, self.last_round_metrics contains detailed
+        MAE/naive metrics for train/val/test splits.
         """
+        self._last_metrics = {}
+
         # Generate candidate hyperparameters
         if current_best_params is not None:
             candidate = self._perturb(current_best_params)
@@ -188,6 +194,11 @@ class PredictorOptimizer(OptimizationPlugin):
         performance = -fitness
 
         return candidate, performance
+
+    @property
+    def last_round_metrics(self) -> dict[str, Any]:
+        """Detailed metrics from the most recent optimize() call."""
+        return getattr(self, "_last_metrics", {})
 
     def _random_params(self) -> dict[str, Any]:
         """Generate random hyperparameters within bounds."""
@@ -237,6 +248,9 @@ class PredictorOptimizer(OptimizationPlugin):
         but for a single candidate, without DEAP.
         """
         import gc
+        import os
+        # Ensure cwd is predictor root so relative data paths resolve
+        os.chdir(str(self._predictor_root))
 
         try:
             import tensorflow as tf
@@ -257,6 +271,10 @@ class PredictorOptimizer(OptimizationPlugin):
         eval_config["mc_samples"] = 1
 
         # Handle special param types (matches predictor's convention)
+        ACTIVATIONS = ["relu", "elu", "selu", "tanh", "sigmoid", "swish", "gelu", "linear"]
+        if "activation" in hyper_params:
+            idx = int(round(hyper_params["activation"])) % len(ACTIVATIONS)
+            eval_config["activation"] = ACTIVATIONS[idx]
         if "positional_encoding" in hyper_params:
             eval_config["positional_encoding"] = bool(int(round(hyper_params["positional_encoding"])))
         if "use_log1p_features" in hyper_params:
@@ -264,6 +282,12 @@ class PredictorOptimizer(OptimizationPlugin):
             if not isinstance(val, list):
                 val_int = int(round(val))
                 eval_config["use_log1p_features"] = ["typical_price"] if val_int == 1 else None
+        # Ensure integer params are ints
+        for int_param in ["window_size", "encoder_conv_layers", "encoder_base_filters",
+                          "encoder_lstm_units", "horizon_attn_heads", "horizon_attn_key_dim",
+                          "horizon_embedding_dim", "batch_size", "early_patience", "kl_anneal_epochs"]:
+            if int_param in eval_config and isinstance(eval_config[int_param], float):
+                eval_config[int_param] = int(round(eval_config[int_param]))
 
         # Preprocess data
         datasets = self._preprocessor_plugin.run_preprocessing(
@@ -298,7 +322,46 @@ class PredictorOptimizer(OptimizationPlugin):
             input_shape=input_shape, x_train=x_train, config=eval_config
         )
 
-        # Train
+        # Update dashboard training state (if dashboard is available)
+        try:
+            from doin_node.dashboard.routes import update_training_state
+            update_training_state(
+                active=True,
+                domain_id=self._predictor_config.get("domain_id", "predictor-timeseries-4h"),
+                round=0,  # Will be set by unified node if needed
+                epoch=0,
+                total_epochs=eval_config.get("epochs", 10),
+                train_mae=None, val_mae=None,
+                train_loss=None, val_loss=None,
+                candidate_params=hyper_params,
+            )
+        except Exception:
+            pass
+
+        # Train (with dashboard callback if available)
+        extra_callbacks = []
+        try:
+            from doin_node.dashboard.routes import update_training_state as _uts
+            import tensorflow as tf
+
+            class _DashboardCallback(tf.keras.callbacks.Callback):
+                def on_epoch_end(self, epoch, logs=None):
+                    logs = logs or {}
+                    _uts(
+                        epoch=epoch + 1,
+                        train_loss=logs.get("loss"),
+                        val_loss=logs.get("val_loss"),
+                        train_mae=logs.get("mae", logs.get("mean_absolute_error")),
+                        val_mae=logs.get("val_mae", logs.get("val_mean_absolute_error")),
+                    )
+            extra_callbacks.append(_DashboardCallback())
+        except Exception:
+            pass
+
+        # Inject extra callbacks via config
+        if extra_callbacks:
+            eval_config["_extra_callbacks"] = extra_callbacks
+
         history, train_preds, _, val_preds, _ = self._predictor_plugin.train(
             x_train, y_train,
             epochs=eval_config.get("epochs", 10),
@@ -307,12 +370,127 @@ class PredictorOptimizer(OptimizationPlugin):
             x_val=x_val, y_val=y_val, config=eval_config,
         )
 
-        # Compute fitness (same as predictor's optimizer: denormalized MAE delta from naive)
-        fitness = self._compute_fitness(
-            val_preds, y_val, baseline_val, eval_config
+        # Mark training as done
+        try:
+            from doin_node.dashboard.routes import update_training_state
+            update_training_state(active=False)
+        except Exception:
+            pass
+
+        # Compute detailed metrics for all splits
+        metrics = self._compute_detailed_metrics(
+            train_preds, y_train, datasets.get("baseline_train"),
+            val_preds, y_val, baseline_val,
+            datasets.get("x_test"), datasets.get("y_test"), datasets.get("baseline_test"),
+            eval_config,
         )
 
-        return fitness
+        # Store on instance for retrieval by optimize()
+        self._last_metrics = metrics
+
+        return metrics["fitness"]
+
+    def _compute_detailed_metrics(
+        self,
+        train_preds: list, y_train: Any, baseline_train: Any,
+        val_preds: list, y_val: Any, baseline_val: Any,
+        x_test: Any, y_test: Any, baseline_test: Any,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Compute MAE and naive MAE for train/val/test, plus fitness.
+
+        Returns dict with keys:
+            fitness, train_mae, train_naive_mae, val_mae, val_naive_mae,
+            test_mae, test_naive_mae
+        """
+        metrics: dict[str, Any] = {}
+
+        # Val fitness (the primary metric)
+        val_result = self._compute_split_mae(val_preds, y_val, baseline_val, config)
+        metrics["val_mae"] = val_result["mae"]
+        metrics["val_naive_mae"] = val_result["naive_mae"]
+        metrics["fitness"] = val_result["fitness"]
+
+        # Train MAE
+        train_result = self._compute_split_mae(train_preds, y_train, baseline_train, config)
+        metrics["train_mae"] = train_result["mae"]
+        metrics["train_naive_mae"] = train_result["naive_mae"]
+
+        # Test MAE (requires running prediction on test set)
+        if x_test is not None and y_test is not None:
+            try:
+                test_preds = self._predictor_plugin.predict(x_test)
+                if not isinstance(test_preds, list):
+                    test_preds = [test_preds]
+                test_result = self._compute_split_mae(test_preds, y_test, baseline_test, config)
+                metrics["test_mae"] = test_result["mae"]
+                metrics["test_naive_mae"] = test_result["naive_mae"]
+            except Exception:
+                metrics["test_mae"] = None
+                metrics["test_naive_mae"] = None
+        else:
+            metrics["test_mae"] = None
+            metrics["test_naive_mae"] = None
+
+        return metrics
+
+    def _compute_split_mae(
+        self,
+        preds: list | None,
+        y_true_raw: Any,
+        baseline: Any,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Compute MAE and naive MAE for a single split."""
+        result = {"mae": float("inf"), "naive_mae": float("inf"), "fitness": float("inf")}
+        if preds is None:
+            return result
+
+        try:
+            from pipeline_plugins.stl_norm import denormalize
+        except ImportError:
+            return result
+
+        predicted_horizons = config.get("predicted_horizons", [1])
+        max_horizon = max(predicted_horizons) if predicted_horizons else 1
+        max_h_idx = predicted_horizons.index(max_horizon) if predicted_horizons else 0
+
+        preds_h = np.asarray(preds[max_h_idx]).flatten()
+
+        if isinstance(y_true_raw, dict):
+            y_true = np.asarray(y_true_raw[f"output_horizon_{max_horizon}"]).flatten()
+        elif isinstance(y_true_raw, list):
+            y_true = np.asarray(y_true_raw[max_h_idx]).flatten()
+        else:
+            y_true = np.asarray(y_true_raw).flatten()
+
+        n = min(len(preds_h), len(y_true))
+        if baseline is not None:
+            n = min(n, len(np.asarray(baseline).flatten()))
+        if n <= 0:
+            return result
+
+        preds_h = preds_h[:n]
+        y_true = y_true[:n]
+
+        real_pred = denormalize(preds_h, config)
+        real_true = denormalize(y_true, config)
+        mae = float(np.mean(np.abs(real_pred - real_true)))
+        result["mae"] = mae
+
+        naive_mae = float("inf")
+        if baseline is not None:
+            baseline_h = np.asarray(baseline).flatten()[:n]
+            real_baseline = denormalize(baseline_h, config)
+            naive_mae = float(np.mean(np.abs(real_baseline - real_true)))
+        result["naive_mae"] = naive_mae
+
+        if np.isfinite(naive_mae) and naive_mae > 0:
+            result["fitness"] = mae - naive_mae
+        else:
+            result["fitness"] = mae
+
+        return result
 
     def _compute_fitness(
         self,

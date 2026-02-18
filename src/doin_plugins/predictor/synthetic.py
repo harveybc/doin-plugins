@@ -1,8 +1,14 @@
 """Synthetic data generator for the predictor domain.
 
-Uses block bootstrap to generate typical_price timeseries data that
-preserves statistical properties of real data but with different values —
-making it impossible to memorize the verification data.
+Loads a PRE-TRAINED HMM hybrid generator model and uses it to produce
+deterministic synthetic typical_price timeseries for DOIN evaluator
+verification.
+
+CRITICAL ARCHITECTURE:
+  - The generator is trained ONCE offline on d1-d4 with optimized params
+  - The trained model is saved as a .joblib file
+  - Evaluators ONLY LOAD the model and call generate() — they NEVER retrain
+  - This mirrors how predictors work: train once → export model → load for inference
 
 CRITICAL: generate() is DETERMINISTIC given the same seed.
 All evaluators in a quorum use the same seed (derived from commitment hash)
@@ -11,23 +17,19 @@ All evaluators in a quorum use the same seed (derived from commitment hash)
 The synthetic data hash is included in each evaluator's vote and checked
 by the quorum to ensure all evaluators used identical data.
 
-Method: Block Bootstrap (proven best in augmentation sweep):
-  - Resamples contiguous blocks from real training data (d1-d3)
-  - Preserves local temporal structure within blocks
-  - Different seed → different block arrangement → different data
-  - No training required — fast, deterministic, reproducible
-
-Sweep results (2026-02-16):
-  - bb_n1000 (bs=30): val +4.39%, test +0.61%  ← best block bootstrap
-  - tg_n500:          val +3.25%, test +1.09%  ← best TimeGAN
-  - All other configs hurt test performance
+Pre-trained model: hmm_hybrid_d1d4_optimized.joblib
+  - Trained on d1-d4 raw prices (18,462 samples)
+  - Optimized config (composite score 0.1984, 32% better than default):
+    n_regimes=5, block_size=30, smooth_weight=0.5,
+    min_block_length=2, covariance_type=diag, vol_windows=(6,16,48)
+  - Tolerance eval: 9.2% mean test deviation
 
 Configuration:
-  n_samples:       Number of 4h typical_price rows (default: 1560 = 1 year)
-  block_size:      Contiguous block length for bootstrap (default: 30)
-  predictor_root:  Path to predictor repo (for loading real data)
-  data_files:      List of CSV paths for source data (overrides auto-detect)
-  quiet:           Suppress verbose output (default: True)
+  n_samples:     Number of 4h typical_price rows (default: 1560 = 1 year)
+  model_file:    Path to pre-trained .joblib model (required)
+  sdg_root:      Path to synthetic-datagen repo (for generator code)
+  initial_price: Starting price for generation (default: 1.2, ~EUR/USD)
+  quiet:         Suppress verbose output (default: True)
 """
 
 from __future__ import annotations
@@ -47,78 +49,82 @@ log = logging.getLogger(__name__)
 
 # 1 year of 4h forex data (no weekends): 260 trading days × 6 candles/day
 SAMPLES_PER_YEAR = 1560
-DEFAULT_BLOCK_SIZE = 30  # Proven optimal in sweep
+
+# Default initial price (~EUR/USD range)
+DEFAULT_INITIAL_PRICE = 1.2
 
 
 class PredictorSyntheticData(SyntheticDataPlugin):
-    """Generates synthetic timeseries data for predictor verification.
+    """Loads a pre-trained HMM hybrid model and generates synthetic data.
 
-    Method: Block bootstrap from real training data (d1-d3).
-    Fast, deterministic, no model training required.
+    The model file is produced offline by training on d1-d4 with optimized
+    parameters. Evaluators load it and call generate(seed) — fast, deterministic,
+    no training involved.
     """
 
     def __init__(self) -> None:
         self._config: dict[str, Any] = {}
-        self._predictor_root: Path | None = None
-        self._real_prices: np.ndarray | None = None
+        self._hybrid_model: dict | None = None
+        self._hybrid_generate = None
         self._n_samples = SAMPLES_PER_YEAR
-        self._block_size = DEFAULT_BLOCK_SIZE
+        self._initial_price = DEFAULT_INITIAL_PRICE
 
     def configure(self, config: dict[str, Any]) -> None:
         self._config = config
         self._n_samples = config.get("n_samples", SAMPLES_PER_YEAR)
-        self._block_size = config.get("block_size", DEFAULT_BLOCK_SIZE)
+        self._initial_price = config.get("initial_price", DEFAULT_INITIAL_PRICE)
 
-        # Resolve predictor repo
-        root = config.get("predictor_root")
-        if root:
-            self._predictor_root = Path(root).resolve()
+        # Resolve synthetic-datagen repo (needed for generator code)
+        sdg_root = config.get("sdg_root")
+        if sdg_root:
+            sdg_path = Path(sdg_root).resolve()
         else:
             for candidate in [
-                Path.home() / "predictor",
-                Path.cwd() / "predictor",
-                Path("/home/openclaw/predictor"),
+                Path.home() / ".openclaw/workspace/synthetic-datagen",
+                Path.home() / "synthetic-datagen",
+                Path.cwd() / "synthetic-datagen",
             ]:
-                if (candidate / "setup.py").exists():
-                    self._predictor_root = candidate
+                if (candidate / "sdg_plugins").exists():
+                    sdg_path = candidate
                     break
+            else:
+                raise FileNotFoundError(
+                    "Cannot find synthetic-datagen repo. Set 'sdg_root' in config."
+                )
 
-        if self._predictor_root is None:
+        if str(sdg_path) not in sys.path:
+            sys.path.insert(0, str(sdg_path))
+
+        # Import generator function
+        from sdg_plugins.generator.regime_bootstrap_hybrid import generate as hybrid_generate
+        self._hybrid_generate = hybrid_generate
+
+        # Load pre-trained model
+        model_file = config.get("model_file")
+        if not model_file:
+            # Default location
+            model_file = sdg_path / "examples" / "models" / "hmm_hybrid_d1d4_optimized.joblib"
+        model_path = Path(model_file).resolve()
+
+        if not model_path.exists():
             raise FileNotFoundError(
-                "Cannot find predictor repo. Set 'predictor_root' in config."
+                f"Pre-trained generator model not found: {model_path}\n"
+                "Train it first with: synthetic-datagen/examples/scripts/train_generator.py"
             )
 
-        self._load_real_data(config.get("data_files"))
-
-    def _load_real_data(self, data_files: list[str] | None = None) -> None:
-        """Load real training data (d1-d3) for block bootstrap source.
-
-        Only d1-d3 are used — these are the generator training sets.
-        d4/d5/d6 are predictor train/val/test and must never be seen by
-        the synthetic generator.
-        """
-        if data_files:
-            paths = [Path(f) for f in data_files]
-        else:
-            data_dir = self._predictor_root / "examples" / "data_downsampled" / "phase_1"
-            paths = [data_dir / f"base_d{i}.csv" for i in range(1, 4)]
-
-        all_prices = []
-        for p in paths:
-            if not p.exists():
-                raise FileNotFoundError(f"Source data not found: {p}")
-            df = pd.read_csv(p)
-            col = "typical_price" if "typical_price" in df.columns else df.columns[-1]
-            all_prices.append(df[col].values)
-
-        self._real_prices = np.concatenate(all_prices)
+        import joblib
+        self._hybrid_model = joblib.load(model_path)
         log.info(
-            "Loaded %d real price samples from %d files for bootstrap",
-            len(self._real_prices), len(paths),
+            "Loaded pre-trained HMM hybrid model from %s "
+            "(K=%d, block_size=%d, covariance=%s)",
+            model_path,
+            self._hybrid_model.get("n_regimes", "?"),
+            self._hybrid_model.get("block_size", "?"),
+            self._hybrid_model.get("covariance_type", "?"),
         )
 
     def generate(self, seed: int | None = None) -> dict[str, Any]:
-        """Generate synthetic data deterministically via block bootstrap.
+        """Generate synthetic data deterministically from pre-trained model.
 
         DETERMINISTIC: same seed → identical output across all evaluators.
         Verified by quorum via synthetic data hash consensus.
@@ -133,33 +139,24 @@ class PredictorSyntheticData(SyntheticDataPlugin):
               - synthetic_csv: CSV string for hashing
               - data_hash: SHA256 hash of synthetic data (for quorum consensus)
               - n_samples: number of generated rows
-              - method: "block_bootstrap"
+              - method: "hmm_hybrid"
               - seed: the seed used
-              - block_size: block size used
         """
-        if self._real_prices is None:
-            raise RuntimeError("Real data not loaded — call configure() first")
+        if self._hybrid_model is None:
+            raise RuntimeError("Model not loaded — call configure() first")
 
         seed = seed or 42
-        rng = np.random.default_rng(seed)
 
-        n_real = len(self._real_prices)
-        bs = min(self._block_size, n_real)
-
-        # Block bootstrap: sample random starting positions, take contiguous blocks
-        indices = []
-        while len(indices) < self._n_samples:
-            start = int(rng.integers(0, max(1, n_real - bs)))
-            indices.extend(range(start, start + bs))
-        indices = indices[:self._n_samples]
-
-        synthetic_prices = self._real_prices[indices].copy()
+        synthetic_prices = self._hybrid_generate(
+            self._hybrid_model, self._n_samples,
+            seed=seed, initial_price=self._initial_price,
+        )
 
         # Build DataFrame with synthetic timestamps (4h intervals, skip weekends)
-        dates = self._generate_trading_dates(self._n_samples, rng)
+        dates = self._generate_trading_dates(self._n_samples)
         df = pd.DataFrame({
             "DATE_TIME": dates,
-            "typical_price": synthetic_prices,
+            "typical_price": synthetic_prices[:self._n_samples],
         })
 
         # Create CSV string for hashing
@@ -167,8 +164,8 @@ class PredictorSyntheticData(SyntheticDataPlugin):
         data_hash = hashlib.sha256(csv_str.encode()).hexdigest()
 
         log.info(
-            "Generated %d synthetic samples (block_size=%d, seed=%d, hash=%s…)",
-            len(df), bs, seed, data_hash[:12],
+            "Generated %d synthetic samples (seed=%d, hash=%s…)",
+            len(df), seed, data_hash[:12],
         )
 
         return {
@@ -176,33 +173,26 @@ class PredictorSyntheticData(SyntheticDataPlugin):
             "synthetic_csv": csv_str,
             "data_hash": data_hash,
             "n_samples": len(df),
-            "method": "block_bootstrap",
+            "method": "hmm_hybrid",
             "seed": seed,
-            "block_size": bs,
         }
 
     def get_data_hash(self, seed: int) -> str:
-        """Quick hash computation for quorum pre-verification.
-
-        Evaluators can exchange hashes before full evaluation to confirm
-        they're all using identical synthetic data.
-        """
+        """Quick hash computation for quorum pre-verification."""
         result = self.generate(seed=seed)
         return result["data_hash"]
 
     @staticmethod
-    def _generate_trading_dates(n: int, rng: np.random.Generator) -> list:
+    def _generate_trading_dates(n: int) -> list:
         """Generate n trading timestamps at 4h intervals, skipping weekends."""
         from datetime import datetime, timedelta
 
         dates = []
-        # Start from a known Monday
-        dt = datetime(2020, 1, 6, 0, 0, 0)  # Monday
+        dt = datetime(2020, 1, 6, 0, 0, 0)  # Known Monday
         while len(dates) < n:
             if dt.weekday() < 5:  # Mon-Fri
                 dates.append(dt)
             dt += timedelta(hours=4)
-            # Skip to Monday if we hit Saturday
-            if dt.weekday() == 5:
+            if dt.weekday() == 5:  # Skip weekends
                 dt += timedelta(days=2)
         return dates[:n]

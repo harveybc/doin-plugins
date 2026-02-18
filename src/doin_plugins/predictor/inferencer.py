@@ -168,7 +168,38 @@ class PredictorInferencer(InferencePlugin):
                 )
 
         # Preprocess — use synthetic data if provided, else standard files
-        if data is not None:
+        if data is not None and "synthetic_df" in data:
+            # Synthetic data from DOIN evaluator verification.
+            # The synthetic plugin generates a complete price series.
+            # We preprocess it through the same pipeline the optimizer uses,
+            # splitting into train/val so the model can be trained and
+            # its generalization independently verified.
+            import tempfile, os
+            synth_df = data["synthetic_df"]
+            n = len(synth_df)
+            # Same split ratios as real data pipeline (60/20/20)
+            i_train = int(n * 0.6)
+            i_val = int(n * 0.8)
+            train_df = synth_df.iloc[:i_train]
+            val_df = synth_df.iloc[i_train:i_val]
+            test_df = synth_df.iloc[i_val:]
+            with tempfile.TemporaryDirectory() as tmpdir:
+                train_path = os.path.join(tmpdir, "train.csv")
+                val_path = os.path.join(tmpdir, "val.csv")
+                test_path = os.path.join(tmpdir, "test.csv")
+                train_df.to_csv(train_path, index=False)
+                val_df.to_csv(val_path, index=False)
+                test_df.to_csv(test_path, index=False)
+                synth_config = copy.deepcopy(eval_config)
+                synth_config["training_file"] = train_path
+                synth_config["validation_file"] = val_path
+                synth_config["testing_file"] = test_path
+                datasets = self._preprocessor_plugin.run_preprocessing(
+                    self._target_plugin, synth_config
+                )
+                if isinstance(datasets, tuple):
+                    datasets = datasets[0]
+        elif data is not None:
             datasets = data
         else:
             datasets = self._preprocessor_plugin.run_preprocessing(
