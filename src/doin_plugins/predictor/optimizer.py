@@ -278,6 +278,15 @@ class PredictorOptimizer(OptimizationPlugin):
 
     # ── Metrics Properties ───────────────────────────────────
 
+    def get_domain_metadata(self) -> dict[str, Any]:
+        """Return metadata about the predictor optimization domain."""
+        return {
+            "performance_metric": "fitness",
+            "higher_is_better": False,  # predictor: lower fitness = better
+            "domain_type": "predictor-timeseries",
+            "optimizer": "DEAP GA with incremental stages",
+        }
+
     @property
     def last_round_metrics(self) -> dict[str, Any]:
         """Detailed metrics from the optimization."""
