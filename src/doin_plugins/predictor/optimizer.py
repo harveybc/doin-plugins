@@ -1,16 +1,15 @@
-"""DON Optimization Plugin for harveybc/predictor.
+"""DOIN Optimization Plugin for harveybc/predictor.
 
-Wraps the predictor's existing plugin stack (predictor_plugin,
-preprocessor_plugin, target_plugin) to perform one optimization step:
+Wraps predictor's real DEAP GA optimizer (default_optimizer) with
+DOIN island-model callbacks for:
+  - Migration IN: inject network champion into population before each generation
+  - Migration OUT: broadcast new local champion to network
+  - Eval service: process 1 pending evaluation request between candidates
+  - Stats: report generation-level metrics to DOIN dashboard/OLAP
 
-1. Load config + plugins from predictor's entry points
-2. Resume from current best params (the DON network's champion)
-3. Perturb hyperparameters within configured bounds
-4. Train the model, compute fitness (lower = better → negated for DON)
-5. Return (params, performance) — DON runner handles improvement detection
-
-This replaces predictor's default_optimizer (DEAP GA) with DON's
-decentralized optimization loop.  Zero changes to predictor code.
+Each DOIN node runs the FULL predictor optimization (DEAP GA with
+incremental stages, populations, generations, crossover, mutation).
+DOIN only adds the migration operator — champion sharing between nodes.
 """
 
 from __future__ import annotations
@@ -18,18 +17,25 @@ from __future__ import annotations
 import copy
 import json
 import os
-import random
 import sys
+import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
 from doin_core.plugins.base import OptimizationPlugin
 
+# Activation mapping (must match predictor's default_optimizer)
+ACTIVATIONS = ["relu", "elu", "selu", "tanh", "sigmoid", "swish", "gelu", "leaky_relu"]
+
 
 class PredictorOptimizer(OptimizationPlugin):
-    """DON optimization plugin that drives predictor's model training.
+    """DOIN optimization plugin that wraps predictor's DEAP GA optimizer.
+
+    This does NOT replace the GA — it wraps it, adding island-model
+    migration via DOIN callbacks.
 
     Config keys (all optional, sane defaults):
         predictor_root: Path to predictor repo (default: auto-detect)
@@ -38,50 +44,48 @@ class PredictorOptimizer(OptimizationPlugin):
         preprocessor_plugin: Name of preprocessor plugin
         target_plugin: Name of target plugin
         hyperparameter_bounds: Dict of {param: [low, high]}
-        step_size_fraction: Fraction of range for perturbation (default 0.15)
-        seed: Random seed
+        epochs: Training epochs per candidate
+        batch_size: Batch size for training
+        + all predictor config keys (passed through)
     """
-
-    # Parameters that must be rounded to int if bounds are both int
-    _INT_HEURISTIC_PARAMS = {
-        "num_layers", "layer_size", "early_patience", "batch_size",
-        "encoder_conv_layers", "encoder_base_filters", "encoder_lstm_units",
-        "horizon_attn_heads", "horizon_attn_key_dim", "horizon_embedding_dim",
-        "kl_anneal_epochs", "window_size",
-    }
 
     def __init__(self) -> None:
         self._config: dict[str, Any] = {}
         self._predictor_config: dict[str, Any] = {}
-        self._bounds: dict[str, tuple[float, float]] = {}
-        self._step_frac = 0.15
-        self._rng = random.Random()
         self._predictor_root: Path | None = None
-
-        # Lazy-loaded predictor components
         self._predictor_plugin: Any = None
         self._preprocessor_plugin: Any = None
         self._target_plugin: Any = None
+        self._deap_optimizer: Any = None  # predictor's default_optimizer.Plugin
+
+        # Thread-safe state for DOIN communication
+        self._network_champion: dict[str, Any] | None = None  # Set by unified node
+        self._network_champion_lock = threading.Lock()
+        self._local_champion_callback: Callable | None = None  # Set by unified node
+        self._eval_service_callback: Callable | None = None  # Set by unified node
+        self._generation_end_callback: Callable | None = None  # Set by unified node
+
+        # Metrics exposed to DOIN
+        self._current_generation: int = 0
+        self._current_stage: int = 1
+        self._total_stages: int = 1
+        self._total_candidates_evaluated: int = 0
+        self._last_gen_stats: dict[str, Any] = {}
+        self._is_running: bool = False
 
     def configure(self, config: dict[str, Any]) -> None:
         self._config = config
-        self._step_frac = config.get("step_size_fraction", 0.15)
 
-        seed = config.get("seed")
-        if seed is not None:
-            self._rng = random.Random(seed)
-            np.random.seed(seed)
-
-        # Resolve predictor repo root
+        # Resolve predictor repo
         root = config.get("predictor_root")
         if root:
             self._predictor_root = Path(root).resolve()
         else:
-            # Try common locations
             for candidate in [
                 Path.home() / "predictor",
                 Path.cwd() / "predictor",
                 Path("/home/openclaw/predictor"),
+                Path("/home/openclaw/.openclaw/workspace/predictor"),
             ]:
                 if (candidate / "setup.py").exists():
                     self._predictor_root = candidate
@@ -92,31 +96,19 @@ class PredictorOptimizer(OptimizationPlugin):
                 "Cannot find predictor repo. Set 'predictor_root' in config."
             )
 
-        # Ensure predictor is importable
         root_str = str(self._predictor_root)
         if root_str not in sys.path:
             sys.path.insert(0, root_str)
 
-        # Load predictor's config (defaults + config file)
         self._load_predictor_config()
-
-        # Extract hyperparameter bounds
-        self._bounds = {}
-        raw_bounds = self._predictor_config.get("hyperparameter_bounds", {})
-        for key, val in raw_bounds.items():
-            if isinstance(val, (list, tuple)) and len(val) == 2:
-                self._bounds[key] = (float(val[0]), float(val[1]))
-
-        # Load predictor plugins
         self._load_plugins()
+        self._load_deap_optimizer()
 
     def _load_predictor_config(self) -> None:
-        """Load predictor config: defaults → config file → DON overrides."""
         from app.config import DEFAULT_VALUES
 
         self._predictor_config = DEFAULT_VALUES.copy()
 
-        # Load config file if specified
         config_file = self._config.get("load_config")
         if config_file:
             config_path = Path(config_file)
@@ -124,455 +116,185 @@ class PredictorOptimizer(OptimizationPlugin):
                 config_path = self._predictor_root / config_path
             if config_path.exists():
                 with open(config_path) as f:
-                    file_config = json.load(f)
-                self._predictor_config.update(file_config)
+                    self._predictor_config.update(json.load(f))
 
-        # Apply any DON-level overrides
-        for key in [
-            "predictor_plugin", "preprocessor_plugin", "target_plugin",
-            "pipeline_plugin", "epochs", "batch_size", "window_size",
-        ]:
-            if key in self._config:
-                self._predictor_config[key] = self._config[key]
+        # Override with DOIN config values
+        for key, val in self._config.items():
+            if key not in ("predictor_root", "load_config", "optimization_callbacks"):
+                self._predictor_config[key] = val
 
-        # Override hyperparameter bounds if provided at DON level
-        if "hyperparameter_bounds" in self._config:
-            self._predictor_config["hyperparameter_bounds"] = self._config["hyperparameter_bounds"]
-
-        # Force optimizer-friendly settings
         self._predictor_config["disable_postfit_uncertainty"] = True
         self._predictor_config.setdefault("quiet", True)
 
     def _load_plugins(self) -> None:
-        """Load predictor's plugins via its entry point system."""
         from app.plugin_loader import load_plugin
 
-        # Predictor plugin
         pred_name = self._predictor_config.get("predictor_plugin", "default_predictor")
         pred_cls, _ = load_plugin("predictor.plugins", pred_name)
         self._predictor_plugin = pred_cls(self._predictor_config)
         self._predictor_plugin.set_params(**self._predictor_config)
 
-        # Preprocessor plugin
         pre_name = self._predictor_config.get("preprocessor_plugin", "default_preprocessor")
         pre_cls, _ = load_plugin("preprocessor.plugins", pre_name)
         self._preprocessor_plugin = pre_cls()
         self._preprocessor_plugin.set_params(**self._predictor_config)
 
-        # Target plugin
         tgt_name = self._predictor_config.get("target_plugin", "default_target")
         tgt_cls, _ = load_plugin("target.plugins", tgt_name)
         self._target_plugin = tgt_cls()
         self._target_plugin.set_params(**self._predictor_config)
 
+    def _load_deap_optimizer(self) -> None:
+        """Load predictor's real DEAP GA optimizer."""
+        from optimizer_plugins.default_optimizer import Plugin as DeapOptimizer
+        self._deap_optimizer = DeapOptimizer()
+        self._deap_optimizer.set_params(**self._predictor_config)
+
+    # ── DOIN Integration Points ──────────────────────────────
+
+    def set_network_champion(self, params: dict[str, Any]) -> None:
+        """Called by unified node when a network champion is received (migration IN)."""
+        with self._network_champion_lock:
+            self._network_champion = params
+
+    def set_local_champion_callback(self, callback: Callable) -> None:
+        """Set callback for when a new local champion is found (migration OUT).
+        callback(params_dict, fitness, metrics_dict, generation, stage_info)
+        """
+        self._local_champion_callback = callback
+
+    def set_eval_service_callback(self, callback: Callable) -> None:
+        """Set callback to process one pending evaluation between candidates.
+        callback(gen, candidate_num, stage_info) -> None
+        """
+        self._eval_service_callback = callback
+
+    def set_generation_end_callback(self, callback: Callable) -> None:
+        """Set callback for end-of-generation stats reporting.
+        callback(population, hof, hyper_keys, gen, stage_info, stats) -> None
+        """
+        self._generation_end_callback = callback
+
+    # ── Callback Implementations ─────────────────────────────
+
+    def _on_generation_start(self, population, hof, hyper_keys, gen, stage_info):
+        """Migration IN: return network champion params to inject into population."""
+        self._current_generation = gen
+        self._current_stage = stage_info.get("stage", 1)
+        self._total_stages = stage_info.get("total_stages", 1)
+        self._total_candidates_evaluated = stage_info.get("total_candidates_evaluated", 0)
+
+        with self._network_champion_lock:
+            champion = self._network_champion
+            self._network_champion = None  # Consume it
+
+        if champion is not None:
+            # Return raw params — the predictor callback hook will inject into population
+            return champion
+        return None
+
+    def _on_new_champion(self, champion_params, fitness, metrics, gen, stage_info):
+        """Migration OUT: broadcast new local champion to DOIN network."""
+        if self._local_champion_callback:
+            self._local_champion_callback(champion_params, fitness, metrics, gen, stage_info)
+
+    def _on_between_candidates(self, gen, candidate_num, stage_info):
+        """Process one pending evaluation request between candidates."""
+        self._total_candidates_evaluated = stage_info.get("total_candidates_evaluated", 0)
+        if self._eval_service_callback:
+            self._eval_service_callback(gen, candidate_num, stage_info)
+
+    def _on_generation_end(self, population, hof, hyper_keys, gen, stage_info, stats):
+        """Report generation-level stats."""
+        self._last_gen_stats = stage_info
+        if self._generation_end_callback:
+            self._generation_end_callback(population, hof, hyper_keys, gen, stage_info, stats)
+
+    # ── Main Optimization Entry Point ────────────────────────
+
     def optimize(
         self,
         current_best_params: dict[str, Any] | None,
         current_best_performance: float | None,
-    ) -> tuple[dict[str, Any], float]:
-        """Run one optimization step.
+    ) -> tuple[dict[str, Any], float] | None:
+        """Run the FULL predictor DEAP GA optimization with DOIN callbacks.
 
-        DON convention: higher performance = better.
-        Predictor convention: lower fitness = better.
-        We negate: DON performance = -predictor_fitness.
-
-        After calling this, self.last_round_metrics contains detailed
-        MAE/naive metrics for train/val/test splits.
+        This runs the entire GA (all stages, all generations) — NOT one step.
+        Returns the best hyperparameters found and their performance.
         """
-        self._last_metrics = {}
+        self._is_running = True
 
-        # Generate candidate hyperparameters
-        if current_best_params is not None:
-            candidate = self._perturb(current_best_params)
-        else:
-            candidate = self._random_params()
+        # Suppress TF noise
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+        os.environ.setdefault("PREDICTOR_QUIET", "1")
 
-        # Evaluate candidate
-        fitness = self._evaluate(candidate)
+        # Build config for predictor optimizer
+        opt_config = copy.deepcopy(self._predictor_config)
 
-        # DON uses higher-is-better; predictor uses lower-is-better
-        performance = -fitness
+        # Inject DOIN callbacks
+        opt_config["optimization_callbacks"] = {
+            "on_generation_start": self._on_generation_start,
+            "on_new_champion": self._on_new_champion,
+            "on_between_candidates": self._on_between_candidates,
+            "on_generation_end": self._on_generation_end,
+        }
 
-        return candidate, performance
+        # If we have a network champion, inject it as the starting point
+        if current_best_params:
+            # Write champion params to a temp file so predictor can load it
+            params_file = opt_config.get("optimization_parameters_file", "optimization_parameters.json")
+            try:
+                with open(params_file, "w") as f:
+                    json.dump(current_best_params, f)
+                opt_config["optimization_resume"] = True
+                opt_config["optimization_parameters_file"] = params_file
+            except Exception:
+                pass
+
+        try:
+            # Run the FULL DEAP GA optimization
+            best_hyper = self._deap_optimizer.optimize(
+                self._predictor_plugin,
+                self._preprocessor_plugin,
+                opt_config,
+            )
+        except Exception as e:
+            print(f"[DOIN] DEAP optimization error: {e}")
+            import traceback
+            traceback.print_exc()
+            self._is_running = False
+            return None
+        finally:
+            self._is_running = False
+
+        if best_hyper is None:
+            return None
+
+        # Get final champion fitness from the optimizer
+        fitness = getattr(self._deap_optimizer, "best_fitness_so_far", float("inf"))
+        performance = -fitness  # DOIN convention: higher = better
+
+        return best_hyper, performance
+
+    # ── Metrics Properties ───────────────────────────────────
 
     @property
     def last_round_metrics(self) -> dict[str, Any]:
-        """Detailed metrics from the most recent optimize() call."""
-        return getattr(self, "_last_metrics", {})
-
-    def _random_params(self) -> dict[str, Any]:
-        """Generate random hyperparameters within bounds."""
-        params: dict[str, Any] = {}
-        for key, (low, high) in self._bounds.items():
-            if self._is_int_param(key, low, high):
-                params[key] = self._rng.randint(int(low), int(high))
-            else:
-                params[key] = self._rng.uniform(low, high)
-        return params
-
-    def _perturb(self, base_params: dict[str, Any]) -> dict[str, Any]:
-        """Perturb parameters around base within bounds."""
-        params: dict[str, Any] = {}
-        for key, (low, high) in self._bounds.items():
-            base_val = base_params.get(key)
-            if base_val is None:
-                # Parameter not in base — random init
-                if self._is_int_param(key, low, high):
-                    params[key] = self._rng.randint(int(low), int(high))
-                else:
-                    params[key] = self._rng.uniform(low, high)
-                continue
-
-            span = high - low
-            sigma = span * self._step_frac
-            new_val = float(base_val) + self._rng.gauss(0, sigma)
-            new_val = max(low, min(high, new_val))  # clamp
-
-            if self._is_int_param(key, low, high):
-                params[key] = int(round(new_val))
-            else:
-                params[key] = new_val
-
-        return params
-
-    def _is_int_param(self, key: str, low: float, high: float) -> bool:
-        """Heuristic: int if both bounds are int or key is known int param."""
-        if key in self._INT_HEURISTIC_PARAMS:
-            return True
-        return isinstance(low, int) and isinstance(high, int)
-
-    def _evaluate(self, hyper_params: dict[str, Any]) -> float:
-        """Train model with given hyperparameters, return fitness (lower = better).
-
-        This replicates the core eval logic from predictor's default_optimizer
-        but for a single candidate, without DEAP.
-        """
-        import gc
-        import os
-        # Ensure cwd is predictor root so relative data paths resolve
-        os.chdir(str(self._predictor_root))
-
-        try:
-            import tensorflow as tf
-        except ImportError:
-            tf = None
-
-        # Clean up from any prior evaluation
-        if hasattr(self._predictor_plugin, "model"):
-            del self._predictor_plugin.model
-        if tf:
-            tf.keras.backend.clear_session()
-        gc.collect()
-
-        # Build evaluation config
-        eval_config = copy.deepcopy(self._predictor_config)
-        eval_config.update(hyper_params)
-        eval_config["disable_postfit_uncertainty"] = True
-        eval_config["mc_samples"] = 1
-
-        # Handle special param types (matches predictor's convention)
-        ACTIVATIONS = ["relu", "elu", "selu", "tanh", "sigmoid", "swish", "gelu", "linear"]
-        if "activation" in hyper_params:
-            idx = int(round(hyper_params["activation"])) % len(ACTIVATIONS)
-            eval_config["activation"] = ACTIVATIONS[idx]
-        if "positional_encoding" in hyper_params:
-            eval_config["positional_encoding"] = bool(int(round(hyper_params["positional_encoding"])))
-        if "use_log1p_features" in hyper_params:
-            val = hyper_params["use_log1p_features"]
-            if not isinstance(val, list):
-                val_int = int(round(val))
-                eval_config["use_log1p_features"] = ["typical_price"] if val_int == 1 else None
-        # Ensure integer params are ints
-        for int_param in ["window_size", "encoder_conv_layers", "encoder_base_filters",
-                          "encoder_lstm_units", "horizon_attn_heads", "horizon_attn_key_dim",
-                          "horizon_embedding_dim", "batch_size", "early_patience", "kl_anneal_epochs"]:
-            if int_param in eval_config and isinstance(eval_config[int_param], float):
-                eval_config[int_param] = int(round(eval_config[int_param]))
-
-        # Preprocess data
-        datasets = self._preprocessor_plugin.run_preprocessing(
-            self._target_plugin, eval_config
-        )
-        if isinstance(datasets, tuple):
-            datasets = datasets[0]
-
-        x_train = datasets["x_train"]
-        y_train = datasets["y_train"]
-        x_val = datasets["x_val"]
-        y_val = datasets["y_val"]
-        baseline_val = datasets.get("baseline_val")
-
-        # Ensure 2D targets
-        y_train = self._ensure_2d_targets(y_train)
-        y_val = self._ensure_2d_targets(y_val)
-
-        # Build model
-        window_size = eval_config.get("window_size")
-        plugin_name = eval_config.get("plugin", "ann")
-        if plugin_name in ["lstm", "cnn", "transformer", "ann", "mimo", "n_beats", "tft"]:
-            if len(x_train.shape) == 3:
-                input_shape = (window_size, x_train.shape[2])
-            else:
-                input_shape = (x_train.shape[1],)
-        else:
-            input_shape = (x_train.shape[1],)
-
-        self._predictor_plugin.set_params(**eval_config)
-        self._predictor_plugin.build_model(
-            input_shape=input_shape, x_train=x_train, config=eval_config
-        )
-
-        # Update dashboard training state (if dashboard is available)
-        try:
-            from doin_node.dashboard.routes import update_training_state
-            update_training_state(
-                active=True,
-                domain_id=self._predictor_config.get("domain_id", "predictor-timeseries-4h"),
-                round=0,  # Will be set by unified node if needed
-                epoch=0,
-                total_epochs=eval_config.get("epochs", 10),
-                train_mae=None, val_mae=None,
-                train_loss=None, val_loss=None,
-                candidate_params=hyper_params,
-            )
-        except Exception:
-            pass
-
-        # Train (with dashboard callback if available)
-        extra_callbacks = []
-        try:
-            from doin_node.dashboard.routes import update_training_state as _uts
-            import tensorflow as tf
-
-            class _DashboardCallback(tf.keras.callbacks.Callback):
-                def on_epoch_end(self, epoch, logs=None):
-                    logs = logs or {}
-                    _uts(
-                        epoch=epoch + 1,
-                        train_loss=logs.get("loss"),
-                        val_loss=logs.get("val_loss"),
-                        train_mae=logs.get("mae", logs.get("mean_absolute_error")),
-                        val_mae=logs.get("val_mae", logs.get("val_mean_absolute_error")),
-                    )
-            extra_callbacks.append(_DashboardCallback())
-        except Exception:
-            pass
-
-        # Inject extra callbacks via config
-        if extra_callbacks:
-            eval_config["_extra_callbacks"] = extra_callbacks
-
-        history, train_preds, _, val_preds, _ = self._predictor_plugin.train(
-            x_train, y_train,
-            epochs=eval_config.get("epochs", 10),
-            batch_size=eval_config.get("batch_size", 32),
-            threshold_error=eval_config.get("threshold_error", 0.001),
-            x_val=x_val, y_val=y_val, config=eval_config,
-        )
-
-        # Mark training as done
-        try:
-            from doin_node.dashboard.routes import update_training_state
-            update_training_state(active=False)
-        except Exception:
-            pass
-
-        # Compute detailed metrics for all splits
-        metrics = self._compute_detailed_metrics(
-            train_preds, y_train, datasets.get("baseline_train"),
-            val_preds, y_val, baseline_val,
-            datasets.get("x_test"), datasets.get("y_test"), datasets.get("baseline_test"),
-            eval_config,
-        )
-
-        # Store on instance for retrieval by optimize()
-        self._last_metrics = metrics
-
-        return metrics["fitness"]
-
-    def _compute_detailed_metrics(
-        self,
-        train_preds: list, y_train: Any, baseline_train: Any,
-        val_preds: list, y_val: Any, baseline_val: Any,
-        x_test: Any, y_test: Any, baseline_test: Any,
-        config: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Compute MAE and naive MAE for train/val/test, plus fitness.
-
-        Returns dict with keys:
-            fitness, train_mae, train_naive_mae, val_mae, val_naive_mae,
-            test_mae, test_naive_mae
-        """
-        metrics: dict[str, Any] = {}
-
-        # Val fitness (the primary metric)
-        val_result = self._compute_split_mae(val_preds, y_val, baseline_val, config)
-        metrics["val_mae"] = val_result["mae"]
-        metrics["val_naive_mae"] = val_result["naive_mae"]
-        metrics["fitness"] = val_result["fitness"]
-
-        # Train MAE
-        train_result = self._compute_split_mae(train_preds, y_train, baseline_train, config)
-        metrics["train_mae"] = train_result["mae"]
-        metrics["train_naive_mae"] = train_result["naive_mae"]
-
-        # Test MAE (requires running prediction on test set)
-        if x_test is not None and y_test is not None:
-            try:
-                test_preds = self._predictor_plugin.predict(x_test)
-                if not isinstance(test_preds, list):
-                    test_preds = [test_preds]
-                test_result = self._compute_split_mae(test_preds, y_test, baseline_test, config)
-                metrics["test_mae"] = test_result["mae"]
-                metrics["test_naive_mae"] = test_result["naive_mae"]
-            except Exception:
-                metrics["test_mae"] = None
-                metrics["test_naive_mae"] = None
-        else:
-            metrics["test_mae"] = None
-            metrics["test_naive_mae"] = None
-
-        return metrics
-
-    def _compute_split_mae(
-        self,
-        preds: list | None,
-        y_true_raw: Any,
-        baseline: Any,
-        config: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Compute MAE and naive MAE for a single split."""
-        result = {"mae": float("inf"), "naive_mae": float("inf"), "fitness": float("inf")}
-        if preds is None:
-            return result
-
-        try:
-            from pipeline_plugins.stl_norm import denormalize
-        except ImportError:
-            return result
-
-        predicted_horizons = config.get("predicted_horizons", [1])
-        max_horizon = max(predicted_horizons) if predicted_horizons else 1
-        max_h_idx = predicted_horizons.index(max_horizon) if predicted_horizons else 0
-
-        preds_h = np.asarray(preds[max_h_idx]).flatten()
-
-        if isinstance(y_true_raw, dict):
-            y_true = np.asarray(y_true_raw[f"output_horizon_{max_horizon}"]).flatten()
-        elif isinstance(y_true_raw, list):
-            y_true = np.asarray(y_true_raw[max_h_idx]).flatten()
-        else:
-            y_true = np.asarray(y_true_raw).flatten()
-
-        n = min(len(preds_h), len(y_true))
-        if baseline is not None:
-            n = min(n, len(np.asarray(baseline).flatten()))
-        if n <= 0:
-            return result
-
-        preds_h = preds_h[:n]
-        y_true = y_true[:n]
-
-        real_pred = denormalize(preds_h, config)
-        real_true = denormalize(y_true, config)
-        mae = float(np.mean(np.abs(real_pred - real_true)))
-        result["mae"] = mae
-
-        naive_mae = float("inf")
-        if baseline is not None:
-            baseline_h = np.asarray(baseline).flatten()[:n]
-            real_baseline = denormalize(baseline_h, config)
-            naive_mae = float(np.mean(np.abs(real_baseline - real_true)))
-        result["naive_mae"] = naive_mae
-
-        if np.isfinite(naive_mae) and naive_mae > 0:
-            result["fitness"] = mae - naive_mae
-        else:
-            result["fitness"] = mae
-
-        return result
-
-    def _compute_fitness(
-        self,
-        val_preds: list,
-        y_val: Any,
-        baseline_val: Any,
-        config: dict[str, Any],
-    ) -> float:
-        """Compute fitness as avg delta from naive (lower = better).
-
-        Matches predictor's default_optimizer fitness calculation.
-        """
-        try:
-            from pipeline_plugins.stl_norm import denormalize, denormalize_returns
-        except ImportError:
-            # Fallback: use raw validation loss from training
-            return float("inf")
-
-        predicted_horizons = config.get("predicted_horizons", [1])
-        max_horizon = max(predicted_horizons) if predicted_horizons else 1
-        max_h_idx = predicted_horizons.index(max_horizon) if predicted_horizons else 0
-
-        # Extract predictions for max horizon
-        val_preds_h = np.asarray(val_preds[max_h_idx]).flatten()
-
-        # Extract targets for max horizon
-        if isinstance(y_val, dict):
-            y_true = np.asarray(y_val[f"output_horizon_{max_horizon}"]).flatten()
-        elif isinstance(y_val, list):
-            y_true = np.asarray(y_val[max_h_idx]).flatten()
-        else:
-            y_true = np.asarray(y_val).flatten()
-
-        # Align lengths
-        n = min(len(val_preds_h), len(y_true))
-        if baseline_val is not None:
-            n = min(n, len(np.asarray(baseline_val).flatten()))
-        if n <= 0:
-            return float("inf")
-
-        val_preds_h = val_preds_h[:n]
-        y_true = y_true[:n]
-
-        # Denormalize and compute MAE
-        real_pred = denormalize(val_preds_h, config)
-        real_true = denormalize(y_true, config)
-        val_mae = float(np.mean(np.abs(real_pred - real_true)))
-
-        # Naive MAE
-        naive_mae = float("inf")
-        if baseline_val is not None:
-            baseline_h = np.asarray(baseline_val).flatten()[:n]
-            real_baseline = denormalize(baseline_h, config)
-            naive_mae = float(np.mean(np.abs(real_baseline - real_true)))
-
-        # Fitness = delta from naive (how much worse than naive; lower = better)
-        if np.isfinite(naive_mae) and naive_mae > 0:
-            fitness = val_mae - naive_mae  # negative = beating naive
-        else:
-            fitness = val_mae
-
-        return fitness
-
-    @staticmethod
-    def _ensure_2d_targets(y: Any) -> Any:
-        """Match predictor's convention: targets as (N, 1) column vectors."""
-        if isinstance(y, dict):
-            return {
-                k: np.asarray(v).reshape(-1, 1).astype(np.float32)
-                for k, v in y.items()
-            }
-        return y
-
-    def get_domain_metadata(self) -> dict[str, Any]:
+        """Detailed metrics from the optimization."""
+        optimizer = self._deap_optimizer
+        if optimizer is None:
+            return {}
         return {
-            "performance_metric": "neg_fitness_delta_from_naive",
-            "higher_is_better": True,
-            "description": (
-                "Timeseries prediction optimization via harveybc/predictor. "
-                "Performance = -fitness where fitness is MAE delta from naive "
-                "(lower fitness = better, so higher performance = better)."
-            ),
-            "predictor_plugin": self._predictor_config.get("predictor_plugin"),
-            "predicted_horizons": self._predictor_config.get("predicted_horizons"),
+            "generation": self._current_generation,
+            "stage": self._current_stage,
+            "total_stages": self._total_stages,
+            "total_candidates_evaluated": self._total_candidates_evaluated,
+            "champion_fitness": getattr(optimizer, "best_fitness_so_far", None),
+            "train_mae": getattr(optimizer, "best_train_mae_so_far", None),
+            "train_naive_mae": getattr(optimizer, "best_train_naive_mae_so_far", None),
+            "val_mae": getattr(optimizer, "best_val_mae_so_far", None),
+            "val_naive_mae": getattr(optimizer, "best_naive_mae_so_far", None),
+            "test_mae": getattr(optimizer, "best_test_mae_so_far", None),
+            "test_naive_mae": getattr(optimizer, "best_test_naive_mae_so_far", None),
+            "is_running": self._is_running,
         }
