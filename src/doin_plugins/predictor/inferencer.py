@@ -157,7 +157,11 @@ class PredictorInferencer(InferencePlugin):
         eval_config["disable_postfit_uncertainty"] = True
         eval_config["mc_samples"] = 1
 
-        # Special param handling
+        # Special param handling (must match optimizer's conventions)
+        ACTIVATIONS = ["relu", "elu", "selu", "tanh", "sigmoid", "swish", "gelu", "linear"]
+        if "activation" in parameters:
+            idx = int(round(parameters["activation"])) % len(ACTIVATIONS)
+            eval_config["activation"] = ACTIVATIONS[idx]
         if "positional_encoding" in parameters:
             eval_config["positional_encoding"] = bool(int(round(parameters["positional_encoding"])))
         if "use_log1p_features" in parameters:
@@ -166,6 +170,12 @@ class PredictorInferencer(InferencePlugin):
                 eval_config["use_log1p_features"] = (
                     ["typical_price"] if int(round(val)) == 1 else None
                 )
+        # Ensure integer params are ints
+        for int_param in ["window_size", "encoder_conv_layers", "encoder_base_filters",
+                          "encoder_lstm_units", "horizon_attn_heads", "horizon_attn_key_dim",
+                          "horizon_embedding_dim", "batch_size", "early_patience", "kl_anneal_epochs"]:
+            if int_param in eval_config and isinstance(eval_config[int_param], float):
+                eval_config[int_param] = int(round(eval_config[int_param]))
 
         # Preprocess — use synthetic data if provided, else standard files
         if data is not None and "synthetic_df" in data:
