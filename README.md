@@ -28,6 +28,13 @@ Predictor's GA runs 5 stages of increasing complexity. DOIN wraps all stages, br
 **Champion broadcasting and migration injection:**
 When `on_champion_found` fires, DOIN broadcasts the champion's parameters as an optimae. Other nodes receiving this optimae inject the champion into their local DEAP population, creating new genetic material for crossover — the classic island model.
 
+**Three-Level Patience System:**
+| Level | Config Key | Controls | Default |
+|-------|------------|----------|---------|
+| **L1** — Candidate Training | `early_patience` | Keras early stopping per candidate | 80–100 |
+| **L2** — Stage Progression | `optimization_patience` | GA generations before advancing stage | 8–10 |
+| **L3** — Meta-Optimizer | *(not yet implemented)* | Network-level param→performance predictor | — |
+
 - **Optimizer**: Wraps predictor's DEAP GA with callback hooks for island-model migration
 - **Inferencer**: Evaluates model on test/synthetic data
 - **Synthetic Data**: Wraps [harveybc/timeseries-gan](https://github.com/harveybc/timeseries-gan) (SC-VAE-GAN) with block bootstrap fallback
