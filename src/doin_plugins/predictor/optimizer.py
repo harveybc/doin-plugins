@@ -64,6 +64,7 @@ class PredictorOptimizer(OptimizationPlugin):
         self._local_champion_callback: Callable | None = None  # Set by unified node
         self._eval_service_callback: Callable | None = None  # Set by unified node
         self._generation_end_callback: Callable | None = None  # Set by unified node
+        self._stage_start_callback: Callable | None = None  # Set by unified node
 
         # Metrics exposed to DOIN
         self._current_generation: int = 0
@@ -175,14 +176,27 @@ class PredictorOptimizer(OptimizationPlugin):
         """
         self._generation_end_callback = callback
 
+    def set_stage_start_callback(self, callback: Callable) -> None:
+        """Set callback for when a new optimization stage begins.
+        callback(stage, total_stages) -> None
+        Called before each stage starts, allowing champion sync from peers.
+        """
+        self._stage_start_callback = callback
+
     # ── Callback Implementations ─────────────────────────────
 
     def _on_generation_start(self, population, hof, hyper_keys, gen, stage_info):
         """Migration IN: return network champion params to inject into population."""
         self._current_generation = gen
-        self._current_stage = stage_info.get("stage", 1)
+        new_stage = stage_info.get("stage", 1)
         self._total_stages = stage_info.get("total_stages", 1)
         self._total_candidates_evaluated = stage_info.get("total_candidates_evaluated", 0)
+
+        # Detect stage transition → request champion from peers
+        if new_stage != self._current_stage or (new_stage == 1 and gen == 0):
+            if self._stage_start_callback:
+                self._stage_start_callback(new_stage, self._total_stages)
+        self._current_stage = new_stage
 
         with self._network_champion_lock:
             champion = self._network_champion
