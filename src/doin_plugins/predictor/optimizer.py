@@ -65,6 +65,9 @@ class PredictorOptimizer(OptimizationPlugin):
         self._eval_service_callback: Callable | None = None  # Set by unified node
         self._generation_end_callback: Callable | None = None  # Set by unified node
         self._stage_start_callback: Callable | None = None  # Set by unified node
+        self._stage_end_callback: Callable | None = None  # Set by unified node
+        # Stage-sync: unified node can signal this node to finish its current stage early
+        self._force_stage_advance = threading.Event()
 
         # Metrics exposed to DOIN
         self._current_generation: int = 0
@@ -80,7 +83,7 @@ class PredictorOptimizer(OptimizationPlugin):
         # Resolve predictor repo
         root = config.get("predictor_root")
         if root:
-            self._predictor_root = Path(root).resolve()
+            self._predictor_root = Path(root).expanduser().resolve()
         else:
             for candidate in [
                 Path.home() / "predictor",
@@ -183,6 +186,18 @@ class PredictorOptimizer(OptimizationPlugin):
         """
         self._stage_start_callback = callback
 
+    def set_stage_end_callback(self, callback: Callable) -> None:
+        """Set callback for when an optimization stage completes.
+        callback(stage, total_stages, champion_params, champion_fitness, metrics)
+        """
+        self._stage_end_callback = callback
+
+    def force_stage_advance(self) -> None:
+        """Signal the optimizer to finish its current stage early.
+        Called by unified node when a STAGE_COMPLETE message arrives from a peer.
+        """
+        self._force_stage_advance.set()
+
     # ── Callback Implementations ─────────────────────────────
 
     def _on_generation_start(self, population, hof, hyper_keys, gen, stage_info):
@@ -198,6 +213,11 @@ class PredictorOptimizer(OptimizationPlugin):
                 self._stage_start_callback(new_stage, self._total_stages)
         self._current_stage = new_stage
 
+        # Stage-sync: if the network finished this stage, force early stopping
+        if self._force_stage_advance.is_set():
+            self._force_stage_advance.clear()
+            return {"_force_stage_advance": True}
+
         with self._network_champion_lock:
             champion = self._network_champion
             self._network_champion = None  # Consume it
@@ -212,11 +232,28 @@ class PredictorOptimizer(OptimizationPlugin):
         if self._local_champion_callback:
             self._local_champion_callback(champion_params, fitness, metrics, gen, stage_info)
 
+    def _on_stage_end(self, stage, total_stages, champion_params, champion_fitness, metrics):
+        """Stage complete: broadcast to network so all nodes advance together."""
+        if self._stage_end_callback:
+            self._stage_end_callback(stage, total_stages, champion_params, champion_fitness, metrics)
+
     def _on_between_candidates(self, gen, candidate_num, stage_info):
-        """Process one pending evaluation request between candidates."""
+        """Process one pending evaluation request between candidates.
+
+        Returns ``{"_force_stage_advance": True}`` when the DOIN network has
+        signalled that all optimizers should advance to the next stage.
+        The predictor's DEAP optimizer checks this return value and breaks
+        out of the current candidate-evaluation loop when set.
+        """
         self._total_candidates_evaluated = stage_info.get("total_candidates_evaluated", 0)
         if self._eval_service_callback:
             self._eval_service_callback(gen, candidate_num, stage_info)
+
+        # Stage-sync: check if the network signalled a stage advance
+        if self._force_stage_advance.is_set():
+            self._force_stage_advance.clear()
+            return {"_force_stage_advance": True}
+        return None
 
     def _on_generation_end(self, population, hof, hyper_keys, gen, stage_info, stats):
         """Report generation-level stats."""
@@ -257,6 +294,7 @@ class PredictorOptimizer(OptimizationPlugin):
             "on_new_champion": self._on_new_champion,
             "on_between_candidates": self._on_between_candidates,
             "on_generation_end": self._on_generation_end,
+            "on_stage_end": self._on_stage_end,
         }
         # Mark callbacks as non-serializable so predictor skips them in JSON dumps
         opt_config["_non_serializable_keys"] = {"optimization_callbacks"}
