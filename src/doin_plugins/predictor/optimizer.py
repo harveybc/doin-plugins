@@ -149,9 +149,16 @@ class PredictorOptimizer(OptimizationPlugin):
         self._target_plugin.set_params(**self._predictor_config)
 
     def _load_deap_optimizer(self) -> None:
-        """Load predictor's real DEAP GA optimizer."""
-        from optimizer_plugins.default_optimizer import Plugin as DeapOptimizer
-        self._deap_optimizer = DeapOptimizer()
+        """Load predictor's optimizer plugin (default_optimizer or neat_optimizer)."""
+        optimizer_name = self._predictor_config.get("optimizer_plugin", "default_optimizer")
+        try:
+            from app.plugin_loader import load_plugin
+            OptClass, _ = load_plugin("optimizer.plugins", optimizer_name)
+            self._deap_optimizer = OptClass()
+        except Exception:
+            # Fallback to default_optimizer if plugin loading fails
+            from optimizer_plugins.default_optimizer import Plugin as DeapOptimizer
+            self._deap_optimizer = DeapOptimizer()
         self._deap_optimizer.set_params(**self._predictor_config)
 
     # ── DOIN Integration Points ──────────────────────────────
@@ -353,7 +360,7 @@ class PredictorOptimizer(OptimizationPlugin):
         optimizer = self._deap_optimizer
         if optimizer is None:
             return {}
-        return {
+        metrics = {
             "generation": self._current_generation,
             "stage": self._current_stage,
             "total_stages": self._total_stages,
@@ -367,3 +374,14 @@ class PredictorOptimizer(OptimizationPlugin):
             "test_naive_mae": getattr(optimizer, "best_test_naive_mae_so_far", None),
             "is_running": self._is_running,
         }
+        # NEAT-specific metrics
+        if hasattr(optimizer, "neat_species_count"):
+            metrics["neat_species_count"] = getattr(optimizer, "neat_species_count", 0)
+            metrics["neat_avg_complexity"] = getattr(optimizer, "neat_avg_complexity", 0)
+            metrics["neat_max_complexity"] = getattr(optimizer, "neat_max_complexity", 0)
+            metrics["neat_min_complexity"] = getattr(optimizer, "neat_min_complexity", 0)
+            metrics["neat_species_details"] = getattr(optimizer, "neat_species_details", [])
+            metrics["optimizer_type"] = "neat"
+        else:
+            metrics["optimizer_type"] = "deap_ga"
+        return metrics
