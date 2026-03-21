@@ -307,13 +307,12 @@ class PredictorOptimizer(OptimizationPlugin):
         opt_config["_non_serializable_keys"] = {"optimization_callbacks"}
 
         # If we have a network champion, inject it as the starting point
-        if current_best_params:
-            # Write champion params to a temp file so predictor can load it
+        # BUT only if the user's config allows resume — never override the user's setting
+        if current_best_params and opt_config.get("optimization_resume", False):
             params_file = opt_config.get("optimization_parameters_file", "optimization_parameters.json")
             try:
                 with open(params_file, "w") as f:
                     json.dump(current_best_params, f)
-                opt_config["optimization_resume"] = True
                 opt_config["optimization_parameters_file"] = params_file
             except Exception:
                 pass
