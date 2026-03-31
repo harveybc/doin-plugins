@@ -156,6 +156,22 @@ class PredictorInferencer(InferencePlugin):
             eval_config["activation"] = ACTIVATIONS[idx]
         if "positional_encoding" in clean_params:
             eval_config["positional_encoding"] = bool(int(round(clean_params["positional_encoding"])))
+        if "use_temporal_features" in clean_params:
+            eval_config["use_temporal_features"] = bool(int(round(clean_params["use_temporal_features"])))
+
+        # Convert encoding params from int to string
+        _ENCODING_NAMES = ["none", "sincos", "onehot"]
+        for _enc_key in ("hod_encoding", "dow_encoding", "moy_encoding"):
+            if _enc_key in eval_config and isinstance(eval_config[_enc_key], (int, float)):
+                _ei = max(0, min(int(round(eval_config[_enc_key])), len(_ENCODING_NAMES) - 1))
+                eval_config[_enc_key] = _ENCODING_NAMES[_ei]
+
+        # Convert loss_type from int to string
+        _LOSS_NAMES = ["mae", "trend_sigma", "pearson_structural", "soft_dtw", "combined_diff"]
+        if "loss_type" in eval_config and isinstance(eval_config["loss_type"], (int, float)):
+            _li = max(0, min(int(round(eval_config["loss_type"])), len(_LOSS_NAMES) - 1))
+            eval_config["loss_type"] = _LOSS_NAMES[_li]
+
         for int_param in ["window_size", "encoder_conv_layers", "encoder_base_filters",
                           "encoder_lstm_units", "horizon_attn_heads", "horizon_attn_key_dim",
                           "horizon_embedding_dim", "batch_size", "early_patience", "kl_anneal_epochs"]:
@@ -266,9 +282,8 @@ class PredictorInferencer(InferencePlugin):
             real_baseline = denormalize(baseline_h, config)
             naive_mae = float(np.mean(np.abs(real_baseline - real_true)))
 
-        if np.isfinite(naive_mae) and naive_mae > 0:
-            return val_mae - naive_mae
-        return val_mae
+        from predictor_plugins.common.fitness import compute_val_only_fitness
+        return compute_val_only_fitness(val_mae, naive_mae)
 
     @staticmethod
     def _ensure_2d(y: Any) -> Any:
