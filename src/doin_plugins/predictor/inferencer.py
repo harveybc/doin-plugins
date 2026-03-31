@@ -158,6 +158,10 @@ class PredictorInferencer(InferencePlugin):
             eval_config["positional_encoding"] = bool(int(round(clean_params["positional_encoding"])))
         if "use_temporal_features" in clean_params:
             eval_config["use_temporal_features"] = bool(int(round(clean_params["use_temporal_features"])))
+        if "add_window_stats" in clean_params:
+            eval_config["add_window_stats"] = bool(int(round(clean_params["add_window_stats"])))
+        if "add_multi_scale_returns" in clean_params:
+            eval_config["add_multi_scale_returns"] = bool(int(round(clean_params["add_multi_scale_returns"])))
 
         # Convert encoding params from int to string
         _ENCODING_NAMES = ["none", "sincos", "onehot"]
