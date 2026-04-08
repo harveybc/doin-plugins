@@ -66,6 +66,7 @@ class PredictorOptimizer(OptimizationPlugin):
         self._generation_end_callback: Callable | None = None  # Set by unified node
         self._stage_start_callback: Callable | None = None  # Set by unified node
         self._stage_end_callback: Callable | None = None  # Set by unified node
+        self._candidate_evaluated_callback: Callable | None = None  # Set by unified node
         # Stage-sync: unified node can signal this node to finish its current stage early
         self._force_stage_advance = threading.Event()
 
@@ -199,6 +200,12 @@ class PredictorOptimizer(OptimizationPlugin):
         """
         self._stage_end_callback = callback
 
+    def set_candidate_evaluated_callback(self, callback: Callable) -> None:
+        """Set callback for when a candidate finishes evaluation.
+        callback(candidate_info_dict) -> None
+        """
+        self._candidate_evaluated_callback = callback
+
     def force_stage_advance(self) -> None:
         """Signal the optimizer to finish its current stage early.
         Called by unified node when a STAGE_COMPLETE message arrives from a peer.
@@ -243,6 +250,11 @@ class PredictorOptimizer(OptimizationPlugin):
         """Stage complete: broadcast to network so all nodes advance together."""
         if self._stage_end_callback:
             self._stage_end_callback(stage, total_stages, champion_params, champion_fitness, metrics)
+
+    def _on_candidate_evaluated(self, candidate_info):
+        """Per-candidate result: forward to unified node for experiment tracking."""
+        if self._candidate_evaluated_callback:
+            self._candidate_evaluated_callback(candidate_info)
 
     def _on_between_candidates(self, gen, candidate_num, stage_info):
         """Process one pending evaluation request between candidates.
@@ -302,6 +314,7 @@ class PredictorOptimizer(OptimizationPlugin):
             "on_between_candidates": self._on_between_candidates,
             "on_generation_end": self._on_generation_end,
             "on_stage_end": self._on_stage_end,
+            "on_candidate_evaluated": self._on_candidate_evaluated,
         }
         # Mark callbacks as non-serializable so predictor skips them in JSON dumps
         opt_config["_non_serializable_keys"] = {"optimization_callbacks"}
