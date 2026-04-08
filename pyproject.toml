@@ -28,10 +28,12 @@ dev = [
 [project.entry-points."doin.optimization"]
 simple_quadratic = "doin_plugins.quadratic_optimizer:QuadraticOptimizer"
 predictor = "doin_plugins.predictor.optimizer:PredictorOptimizer"
+binary_predictor = "doin_plugins.predictor.binary_optimizer:BinaryPredictorOptimizer"
 
 [project.entry-points."doin.inference"]
 simple_quadratic = "doin_plugins.quadratic_inferencer:QuadraticInferencer"
 predictor = "doin_plugins.predictor.inferencer:PredictorInferencer"
+binary_predictor = "doin_plugins.predictor.binary_inferencer:BinaryPredictorInferencer"
 
 [project.entry-points."doin.synthetic_data"]
 simple_quadratic = "doin_plugins.quadratic_synthetic:QuadraticSyntheticData"
