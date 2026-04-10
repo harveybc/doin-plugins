@@ -397,3 +397,59 @@ class PredictorOptimizer(OptimizationPlugin):
         else:
             metrics["optimizer_type"] = "deap_ga"
         return metrics
+
+    # ── Shared-Population Bridge Methods ─────────────────────
+
+    def setup_shared_mode(self) -> None:
+        """Initialize predictor environment for shared-population evaluation.
+
+        Must be called before create_shared_population() or evaluate_candidate().
+        Sets cwd to predictor root so relative data paths resolve correctly.
+        """
+        if self._predictor_root:
+            os.chdir(str(self._predictor_root))
+
+    def get_shared_opt_config(self) -> dict[str, Any]:
+        """Return the merged predictor config for shared-population methods."""
+        return copy.deepcopy(self._predictor_config)
+
+    def create_shared_population(self, population_size: int, seed: int = 42) -> dict[str, Any]:
+        """Create initial population for shared-population mode.
+
+        Returns serializable dict with population, innovation_tracker,
+        stage_schedule, and config_snapshot.
+        """
+        self.setup_shared_mode()
+        opt_config = self.get_shared_opt_config()
+        return self._deap_optimizer.create_shared_population(population_size, opt_config, seed=seed)
+
+    def evaluate_candidate(self, genome_serialized: dict, generation: int) -> dict[str, Any]:
+        """Evaluate a single genome for shared-population mode.
+
+        Returns dict with fitness, metrics, hyper_dict, and optionally _model_b64.
+        """
+        self.setup_shared_mode()
+        opt_config = self.get_shared_opt_config()
+        return self._deap_optimizer.evaluate_single_genome(genome_serialized, generation, opt_config)
+
+    def reproduce_shared(
+        self,
+        evaluated_pop: list[dict],
+        generation: int,
+        seed: int,
+        innovation_tracker_data: dict,
+        stage_schedule: list[dict],
+        param_defaults: dict,
+        current_stage_idx: int = 0,
+        no_improve_count: int = 0,
+    ) -> dict[str, Any]:
+        """Deterministic reproduction for shared-population mode.
+
+        Returns dict with next population + updated state.
+        """
+        opt_config = self.get_shared_opt_config()
+        return self._deap_optimizer.reproduce_shared(
+            evaluated_pop, generation, seed, opt_config,
+            innovation_tracker_data, stage_schedule,
+            param_defaults, current_stage_idx, no_improve_count,
+        )
