@@ -64,8 +64,10 @@ class BinaryPredictorInferencer(PredictorInferencer):
             from predictor_plugins.common.binary_fitness import (
                 compute_binary_metrics_for_split,
                 compute_binary_val_only_fitness,
+                find_best_threshold,
             )
-            val_metrics = compute_binary_metrics_for_split(y_true, val_preds_h)
+            best_threshold = find_best_threshold(y_true, val_preds_h)
+            val_metrics = compute_binary_metrics_for_split(y_true, val_preds_h, threshold=best_threshold)
             return compute_binary_val_only_fitness(val_metrics)
         except ImportError:
             # Fallback: compute AUC directly
