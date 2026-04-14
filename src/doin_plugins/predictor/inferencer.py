@@ -238,8 +238,8 @@ class PredictorInferencer(InferencePlugin):
                 tf.keras.backend.clear_session()
             gc.collect()
 
-        # Return DON performance (higher = better)
-        return -fitness
+        # Return DON performance (fitness is already in correct direction per domain)
+        return fitness
 
     def _compute_fitness(
         self,

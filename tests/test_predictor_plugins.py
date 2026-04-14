@@ -193,17 +193,16 @@ class TestFitnessConvention:
     """Verify the DON ↔ predictor performance sign convention."""
 
     def test_negation_convention(self):
-        """DON performance = -predictor_fitness.
+        """DON performance = predictor_fitness (direct, no negation).
         
-        predictor: fitness 0.5 (bad) → DON: -0.5
-        predictor: fitness -0.1 (good, beating naive) → DON: 0.1
-        So higher DON performance = lower predictor fitness = better.
+        Binary predictor: fitness 0.5 (good, higher weighted F1)
+        Binary predictor: fitness 0.1 (bad, lower weighted F1)
+        So higher DON performance = higher predictor fitness = better.
+        
+        Regression predictor: fitness 0.5 (bad MAE) 
+        So lower DON performance = lower predictor fitness = better.
         """
-        # Simulate: optimizer returns performance = -fitness
-        fitness_bad = 0.5
-        fitness_good = -0.1
-
-        perf_bad = -fitness_bad
-        perf_good = -fitness_good
-
-        assert perf_good > perf_bad  # DON correctly ranks good > bad
+        # Binary: higher fitness = better
+        fitness_good = 0.5
+        fitness_bad = 0.1
+        assert fitness_good > fitness_bad  # DON correctly ranks good > bad

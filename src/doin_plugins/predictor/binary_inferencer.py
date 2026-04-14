@@ -54,7 +54,7 @@ class BinaryPredictorInferencer(PredictorInferencer):
 
         n = min(len(val_preds_h), len(y_true))
         if n <= 0:
-            return float("inf")
+            return float("-inf")
 
         val_preds_h = val_preds_h[:n]
         y_true = y_true[:n]

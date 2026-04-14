@@ -30,7 +30,7 @@ class BinaryPredictorOptimizer(PredictorOptimizer):
         return {
             "performance_metric": "binary_fitness",
             "metric_type": "binary",
-            "higher_is_better": False,  # Binary fitness: lower = better (negative weighted F1)
+            "higher_is_better": True,  # Binary fitness: higher = better (positive weighted F1)
             "domain_type": "predictor-binary-classification",
             "optimizer": "NEAT GA with staged optimization",
             "primary_metric": "Accuracy",
