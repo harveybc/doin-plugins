@@ -30,19 +30,19 @@ class BinaryPredictorOptimizer(PredictorOptimizer):
         return {
             "performance_metric": "binary_fitness",
             "metric_type": "binary",
-            "higher_is_better": False,  # Binary fitness: lower = better (negative AUC)
+            "higher_is_better": False,  # Binary fitness: lower = better (negative weighted F1)
             "domain_type": "predictor-binary-classification",
             "optimizer": "NEAT GA with staged optimization",
-            "primary_metric": "AUC-ROC",
+            "primary_metric": "Accuracy",
             "secondary_metric": "F1",
             "metric_labels": {
-                "val_mae": "Val AUC-ROC",
-                "train_mae": "Train AUC-ROC",
+                "val_mae": "Val Accuracy",
+                "train_mae": "Train Accuracy",
                 "val_naive_mae": "Val F1",
                 "train_naive_mae": "Train F1",
-                "test_mae": "Test AUC-ROC",
+                "test_mae": "Test Accuracy",
                 "test_naive_mae": "Test F1",
-                "fitness": "Binary Fitness (PAA)",
+                "fitness": "Binary Fitness (weighted F1)",
             },
         }
 
