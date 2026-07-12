@@ -27,12 +27,19 @@ class AgentMultiRuntime:
         from app.canonical_config import load_json_object, resolve_config
         from app.config import DEFAULT_VALUES
 
+        base_config = None
+        base_file = config.get("base_config")
+        if base_file:
+            base_path = self._config_path(base_file)
+            base_config = load_json_object(base_path)
+            self.base_config_path = base_path.resolve()
+        else:
+            self.base_config_path = None
+
         file_config = None
         config_file = config.get("load_config") or config.get("agent_multi_config")
         if config_file:
-            path = Path(config_file).expanduser()
-            if not path.is_absolute():
-                path = self.root / path
+            path = self._config_path(config_file)
             file_config = load_json_object(path)
             self.config_path = path.resolve()
         else:
@@ -43,12 +50,17 @@ class AgentMultiRuntime:
             key: value
             for key, value in config.items()
             if key not in {
-                "agent_multi_root", "load_config", "agent_multi_config",
+                "agent_multi_root", "base_config", "load_config", "agent_multi_config",
                 "optimization_callbacks", "initial_candidate_params", "runtime_overlay",
                 "current_best_performance", "node_seed_offset",
             }
         }
-        resolution = resolve_config(DEFAULT_VALUES, file_config=file_config, cli_overrides=cli_overrides)
+        resolution = resolve_config(
+            DEFAULT_VALUES,
+            base_profile=base_config,
+            file_config=file_config,
+            cli_overrides=cli_overrides,
+        )
         self.resolution = resolution
         self.runtime_manifest = None
         overlay_file = config.get("runtime_overlay")
@@ -71,6 +83,10 @@ class AgentMultiRuntime:
             self.runtime_config = resolution.runtime
         self.runtime_config["agent_multi_root"] = str(self.root)
         self.config_hash = resolution.canonical.canonical_hash
+
+    def _config_path(self, value: str) -> Path:
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else self.root / path
 
     @staticmethod
     def _resolve_root(value: str | None) -> Path:

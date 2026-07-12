@@ -44,8 +44,16 @@ class TradingOptimizer(OptimizationPlugin):
         run_config = copy.deepcopy(self._runtime.runtime_config)
         run_config.update({
             key: value for key, value in self._config.items()
-            if key not in {"agent_multi_root", "load_config", "agent_multi_config"}
+            if key not in {
+                "agent_multi_root", "base_config", "load_config", "agent_multi_config"
+            }
         })
+        # Keep candidate evaluation deterministic across nodes while giving
+        # each optimization island a distinct search trajectory. Training and
+        # evaluation seeds remain canonical; only the local GA seed is offset.
+        run_config["ga_seed"] = int(run_config.get("ga_seed", 0)) + int(
+            run_config.get("node_seed_offset", 0)
+        )
         if seed_params:
             run_config["initial_candidate_params"] = _clean_parameters(seed_params)
         run_config["current_best_performance"] = current_best_performance

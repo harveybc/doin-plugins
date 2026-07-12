@@ -84,6 +84,7 @@ def test_doin_optimizer_delegates_to_local_optimizer(monkeypatch) -> None:
         def optimize(self, **kwargs):
             assert kwargs["config"]["optimization_capture_model_artifact"] is True
             assert kwargs["config"]["optimization_require_model_artifact"] is True
+            assert kwargs["config"]["ga_seed"] == 12
             callbacks = kwargs["config"]["optimization_callbacks"]
             callbacks["on_new_champion"](
                 {"learning_rate": 0.1}, 0.25, {"mean_weekly_rap": 0.25}, 0,
@@ -116,7 +117,11 @@ def test_doin_optimizer_delegates_to_local_optimizer(monkeypatch) -> None:
 
     monkeypatch.setattr(trading_optimizer, "AgentMultiRuntime", FakeRuntime)
     plugin = trading_optimizer.TradingOptimizer()
-    plugin.configure({"optimization_metric": "mean_weekly_rap"})
+    plugin.configure({
+        "optimization_metric": "mean_weekly_rap",
+        "ga_seed": 10,
+        "node_seed_offset": 2,
+    })
     seen = []
     plugin.set_local_champion_callback(lambda *args: seen.append(args))
 
