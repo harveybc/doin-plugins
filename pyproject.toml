@@ -15,6 +15,7 @@ authors = [
 dependencies = [
     "doin-core>=0.1.0",
     "numpy>=1.24",
+    "pandas>=2.1",
 ]
 
 [project.optional-dependencies]
@@ -29,15 +30,18 @@ dev = [
 simple_quadratic = "doin_plugins.quadratic_optimizer:QuadraticOptimizer"
 predictor = "doin_plugins.predictor.optimizer:PredictorOptimizer"
 binary_predictor = "doin_plugins.predictor.binary_optimizer:BinaryPredictorOptimizer"
+trading_asset = "doin_plugins.trading.optimizer:TradingOptimizer"
 
 [project.entry-points."doin.inference"]
 simple_quadratic = "doin_plugins.quadratic_inferencer:QuadraticInferencer"
 predictor = "doin_plugins.predictor.inferencer:PredictorInferencer"
 binary_predictor = "doin_plugins.predictor.binary_inferencer:BinaryPredictorInferencer"
+trading_asset = "doin_plugins.trading.inferencer:TradingInferencer"
 
 [project.entry-points."doin.synthetic_data"]
 simple_quadratic = "doin_plugins.quadratic_synthetic:QuadraticSyntheticData"
 predictor = "doin_plugins.predictor.synthetic:PredictorSyntheticData"
+trading_scenario = "doin_plugins.trading.synthetic:TradingScenarioSyntheticData"
 
 [project.urls]
 Homepage = "https://github.com/harveybc/doin-plugins"

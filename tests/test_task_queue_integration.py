@@ -17,6 +17,11 @@ import json
 import pytest
 from aiohttp import ClientSession, ClientTimeout
 
+pytest.importorskip(
+    "doin_evaluator",
+    reason="legacy split-service integration; active coverage lives in unified doin-node",
+)
+
 from doin_core.models.domain import Domain, DomainConfig
 from doin_core.models.task import TaskType
 from doin_core.protocol.messages import Message, MessageType, OptimaeAnnouncement
