@@ -9,7 +9,9 @@ the ``OptimizationPlugin`` contract.
 from __future__ import annotations
 
 import copy
+import os
 import threading
+from pathlib import Path
 from typing import Any, Callable
 
 from doin_core.plugins.base import OptimizationPlugin
@@ -27,6 +29,7 @@ class TradingOptimizer(OptimizationPlugin):
         self._lock = threading.Lock()
         self._callbacks: dict[str, Callable[..., Any] | None] = {}
         self._force_stage_advance = threading.Event()
+        self._statistics_cache: dict[str, Any] = {}
 
     def configure(self, config: dict[str, Any]) -> None:
         self._config = copy.deepcopy(config)
@@ -106,6 +109,41 @@ class TradingOptimizer(OptimizationPlugin):
             "higher_is_better": bool(self._config.get("higher_is_better", True)),
             "domain_type": "agent-multi-trading",
             "config_hash": self._runtime.config_hash if self._runtime else None,
+        }
+
+    def get_runtime_statistics(self) -> dict[str, Any]:
+        """Return durable local optimizer counters without scanning on every poll."""
+        if self._runtime is None:
+            return {"candidate_evaluations_total": 0}
+
+        raw_path = self._runtime.runtime_config.get("optimization_candidate_history")
+        if not raw_path:
+            return {"candidate_evaluations_total": 0}
+        path = Path(os.path.expandvars(str(raw_path))).expanduser()
+        if not path.is_absolute():
+            path = self._runtime.root / path
+        path = path.resolve()
+
+        try:
+            stat = path.stat()
+        except OSError:
+            return {
+                "candidate_evaluations_total": 0,
+                "candidate_history_source": str(path),
+            }
+
+        cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+        if self._statistics_cache.get("key") != cache_key:
+            with path.open("rb") as handle:
+                row_count = sum(1 for _line in handle)
+            self._statistics_cache = {
+                "key": cache_key,
+                "candidate_evaluations_total": max(0, row_count - 1),
+                "candidate_history_source": str(path),
+            }
+        return {
+            key: value for key, value in self._statistics_cache.items()
+            if key != "key"
         }
 
     # DOIN island-model callback surface. These names intentionally match the

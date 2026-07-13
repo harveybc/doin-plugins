@@ -183,6 +183,24 @@ def test_local_optimizer_accepts_seed_and_emits_doin_callbacks() -> None:
     assert candidates
 
 
+def test_trading_optimizer_reports_durable_candidate_history(tmp_path) -> None:
+    history = tmp_path / "candidate_history.csv"
+    history.write_text("header\nfirst\nsecond\n", encoding="utf-8")
+    plugin = TradingOptimizer()
+    plugin._runtime = type("Runtime", (), {
+        "root": tmp_path,
+        "runtime_config": {"optimization_candidate_history": str(history)},
+    })()
+
+    first = plugin.get_runtime_statistics()
+    assert first["candidate_evaluations_total"] == 2
+    assert first["candidate_history_source"] == str(history)
+
+    with history.open("a", encoding="utf-8") as handle:
+        handle.write("third\n")
+    assert plugin.get_runtime_statistics()["candidate_evaluations_total"] == 3
+
+
 def test_trading_inferencer_decodes_champion_and_uses_metric_plugin_output(monkeypatch) -> None:
     import doin_plugins.trading.inferencer as trading_inferencer
 
