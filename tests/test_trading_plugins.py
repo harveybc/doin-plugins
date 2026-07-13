@@ -185,7 +185,13 @@ def test_local_optimizer_accepts_seed_and_emits_doin_callbacks() -> None:
 
 def test_trading_optimizer_reports_durable_candidate_history(tmp_path) -> None:
     history = tmp_path / "candidate_history.csv"
-    history.write_text("header\nfirst\nsecond\n", encoding="utf-8")
+    history.write_text(
+        "timestamp_utc,fitness\n"
+        "2026-07-13T12:00:00+00:00,0.1\n"
+        "2026-07-13T12:05:00+00:00,0.2\n"
+        "2026-07-13T12:10:00+00:00,0.3\n",
+        encoding="utf-8",
+    )
     plugin = TradingOptimizer()
     plugin._runtime = type("Runtime", (), {
         "root": tmp_path,
@@ -193,12 +199,38 @@ def test_trading_optimizer_reports_durable_candidate_history(tmp_path) -> None:
     })()
 
     first = plugin.get_runtime_statistics()
-    assert first["candidate_evaluations_total"] == 2
+    assert first["candidate_evaluations_total"] == 3
     assert first["candidate_history_source"] == str(history)
+    assert first["candidates_per_hour"] == pytest.approx(12.0)
+    assert first["candidate_seconds_median"] == pytest.approx(300.0)
+    assert first["rate_sample_size"] == 2
 
     with history.open("a", encoding="utf-8") as handle:
-        handle.write("third\n")
-    assert plugin.get_runtime_statistics()["candidate_evaluations_total"] == 3
+        handle.write("2026-07-13T12:15:00+00:00,0.4\n")
+    assert plugin.get_runtime_statistics()["candidate_evaluations_total"] == 4
+
+
+def test_trading_optimizer_rate_excludes_restart_downtime(tmp_path) -> None:
+    history = tmp_path / "candidate_history.csv"
+    history.write_text(
+        "timestamp_utc,fitness\n"
+        "2026-07-12T08:00:00+00:00,0.1\n"
+        "2026-07-13T12:00:00+00:00,0.2\n"
+        "2026-07-13T12:06:00+00:00,0.3\n"
+        "2026-07-13T12:12:00+00:00,0.4\n",
+        encoding="utf-8",
+    )
+    plugin = TradingOptimizer()
+    plugin._runtime = type("Runtime", (), {
+        "root": tmp_path,
+        "runtime_config": {"optimization_candidate_history": str(history)},
+    })()
+
+    statistics = plugin.get_runtime_statistics()
+
+    assert statistics["candidate_evaluations_total"] == 4
+    assert statistics["candidates_per_hour"] == pytest.approx(10.0)
+    assert statistics["rate_sample_size"] == 2
 
 
 def test_trading_inferencer_decodes_champion_and_uses_metric_plugin_output(monkeypatch) -> None:

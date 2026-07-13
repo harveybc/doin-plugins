@@ -9,8 +9,11 @@ the ``OptimizationPlugin`` contract.
 from __future__ import annotations
 
 import copy
+import csv
 import os
+import statistics
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -112,7 +115,7 @@ class TradingOptimizer(OptimizationPlugin):
         }
 
     def get_runtime_statistics(self) -> dict[str, Any]:
-        """Return durable local optimizer counters without scanning on every poll."""
+        """Return durable local throughput statistics without rescanning per poll."""
         if self._runtime is None:
             return {"candidate_evaluations_total": 0}
 
@@ -134,12 +137,11 @@ class TradingOptimizer(OptimizationPlugin):
 
         cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
         if self._statistics_cache.get("key") != cache_key:
-            with path.open("rb") as handle:
-                row_count = sum(1 for _line in handle)
+            history = _candidate_history_statistics(path)
             self._statistics_cache = {
                 "key": cache_key,
-                "candidate_evaluations_total": max(0, row_count - 1),
                 "candidate_history_source": str(path),
+                **history,
             }
         return {
             key: value for key, value in self._statistics_cache.items()
@@ -198,3 +200,71 @@ def _clean_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
         key: value for key, value in parameters.items()
         if not key.startswith("_doin_") and not key.startswith("_metric_")
     }
+
+
+def _candidate_history_statistics(
+    path: Path,
+    *,
+    recent_completions: int = 20,
+) -> dict[str, Any]:
+    """Summarize an append-only candidate history using completion timestamps.
+
+    The median completion interval is deliberately used instead of wall-clock
+    time since the first row. This keeps restarts and machine downtime from
+    distorting the live throughput estimate.
+    """
+    timestamps: list[datetime] = []
+    row_count = 0
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            row_count += 1
+            raw_timestamp = str(row.get("timestamp_utc") or "").strip()
+            if not raw_timestamp:
+                continue
+            try:
+                timestamps.append(datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00")))
+            except ValueError:
+                continue
+
+    result: dict[str, Any] = {"candidate_evaluations_total": row_count}
+    if timestamps:
+        result["last_candidate_at"] = timestamps[-1].isoformat()
+
+    recent = timestamps[-max(2, int(recent_completions)):]
+    intervals = [
+        (current - previous).total_seconds()
+        for previous, current in zip(recent, recent[1:])
+        if current > previous
+    ]
+    if len(intervals) < 2:
+        return result
+
+    baseline = statistics.median(intervals)
+    # One interval can span a reboot or a paused optimizer. Exclude only clear
+    # downtime while retaining legitimately slow candidates.
+    downtime_limit = max(3600.0, baseline * 6.0)
+    active_intervals = [seconds for seconds in intervals if seconds <= downtime_limit]
+    if len(active_intervals) < 2:
+        return result
+
+    median_seconds = statistics.median(active_intervals)
+    result.update({
+        "candidates_per_hour": 3600.0 / median_seconds,
+        "candidate_seconds_median": median_seconds,
+        "candidate_seconds_p25": _percentile(active_intervals, 0.25),
+        "candidate_seconds_p75": _percentile(active_intervals, 0.75),
+        "rate_sample_size": len(active_intervals),
+    })
+    return result
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
