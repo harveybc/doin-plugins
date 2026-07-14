@@ -33,10 +33,12 @@ class TradingOptimizer(OptimizationPlugin):
         self._callbacks: dict[str, Callable[..., Any] | None] = {}
         self._force_stage_advance = threading.Event()
         self._statistics_cache: dict[str, Any] = {}
+        self._shared_local_optimizer: Any | None = None
 
     def configure(self, config: dict[str, Any]) -> None:
         self._config = copy.deepcopy(config)
         self._runtime = AgentMultiRuntime(self._config)
+        self._shared_local_optimizer = None
 
     def optimize(
         self,
@@ -193,6 +195,93 @@ class TradingOptimizer(OptimizationPlugin):
         callbacks["network_champion_provider"] = self._take_network_champion
         callbacks["stage_advance_requested"] = self._force_stage_advance.is_set
         return callbacks
+
+    # ── Shared-population bridge ──────────────────────────────────
+    # This is intentionally the same bridge surface as PredictorOptimizer.
+    # The shared pool, candidate claim protocol, blockchain state and peer
+    # coordination remain doin-node responsibilities.  agent-multi retains
+    # ownership of the genome, L1 training and L2 candidate fitness.
+    def setup_shared_mode(self) -> None:
+        """Prepare one local agent-multi evaluator for a shared candidate pool."""
+        if self._shared_local_optimizer is not None:
+            return
+        if self._runtime is None:
+            raise RuntimeError("TradingOptimizer.configure() must be called first")
+
+        run_config = self._shared_run_config()
+        env, agent, pipeline, _ = self._runtime.build_components(run_config)
+        local_optimizer = self._runtime.load_local_optimizer(run_config)
+        setup = getattr(local_optimizer, "setup_shared_mode", None)
+        if not callable(setup):
+            raise TypeError(
+                "selected agent-multi optimizer does not implement the shared-population bridge"
+            )
+        setup(
+            env_plugin=env,
+            agent_plugin=agent,
+            pipeline_plugin=pipeline,
+            config=run_config,
+        )
+        self._shared_local_optimizer = local_optimizer
+
+    def create_shared_population(self, population_size: int, seed: int = 42) -> dict[str, Any]:
+        self.setup_shared_mode()
+        assert self._shared_local_optimizer is not None
+        return self._shared_local_optimizer.create_shared_population(
+            population_size,
+            seed=seed,
+        )
+
+    def evaluate_candidate(self, genome_serialized: dict[str, Any], generation: int) -> dict[str, Any]:
+        self.setup_shared_mode()
+        assert self._shared_local_optimizer is not None
+        return self._shared_local_optimizer.evaluate_candidate(genome_serialized, generation)
+
+    def reproduce_shared(
+        self,
+        evaluated_pop: list[dict[str, Any]],
+        generation: int,
+        seed: int,
+        innovation_tracker_data: dict[str, Any],
+        stage_schedule: list[dict[str, Any]],
+        param_defaults: dict[str, Any],
+        current_stage_idx: int = 0,
+        no_improve_count: int = 0,
+    ) -> dict[str, Any]:
+        self.setup_shared_mode()
+        assert self._shared_local_optimizer is not None
+        return self._shared_local_optimizer.reproduce_shared(
+            evaluated_pop,
+            generation,
+            seed,
+            innovation_tracker_data,
+            stage_schedule,
+            param_defaults,
+            current_stage_idx,
+            no_improve_count,
+        )
+
+    def _shared_run_config(self) -> dict[str, Any]:
+        """Build the canonical shared-run config without island seed offsets."""
+        assert self._runtime is not None
+        run_config = copy.deepcopy(self._runtime.runtime_config)
+        run_config.update({
+            key: value for key, value in self._config.items()
+            if key not in {
+                "agent_multi_root", "base_config", "load_config", "agent_multi_config",
+            }
+        })
+        # A shared population already has one deterministic domain seed.  Do
+        # not apply the island-only node_seed_offset used by the legacy local
+        # DEAP migration path.
+        run_config["ga_seed"] = int(run_config.get("ga_seed", 0))
+        # doin-node strips model bytes from candidate-result broadcasts and
+        # retains them only when the candidate becomes a champion.  The exact
+        # trained artifact is therefore available for the existing commit /
+        # reveal and evaluator paths without a second training implementation.
+        run_config["optimization_capture_model_artifact"] = True
+        run_config["optimization_require_model_artifact"] = True
+        return run_config
 
 
 def _clean_parameters(parameters: dict[str, Any]) -> dict[str, Any]:

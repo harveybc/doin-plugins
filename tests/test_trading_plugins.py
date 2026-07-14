@@ -135,6 +135,67 @@ def test_doin_optimizer_delegates_to_local_optimizer(monkeypatch) -> None:
     assert seen and seen[0][1] == pytest.approx(0.25)
 
 
+def test_trading_optimizer_delegates_shared_population_bridge(monkeypatch) -> None:
+    import doin_plugins.trading.optimizer as trading_optimizer
+
+    class FakeLocalOptimizer:
+        def __init__(self) -> None:
+            self.setup_config = None
+
+        def setup_shared_mode(self, **kwargs):
+            self.setup_config = kwargs["config"]
+
+        def create_shared_population(self, population_size, *, seed):
+            assert population_size == 4
+            assert seed == 71
+            return {"population": [{"parameters": {"score": 0.1}}]}
+
+        def evaluate_candidate(self, genome, generation):
+            assert genome == {"parameters": {"score": 0.1}}
+            assert generation == 3
+            return {"fitness": 0.2, "hyper_dict": {"score": 0.1}}
+
+        def reproduce_shared(self, *args):
+            return {"generation": args[1] + 1, "population": []}
+
+    local = FakeLocalOptimizer()
+
+    class FakeRuntime:
+        config_hash = "sha256:test"
+        runtime_config = {
+            "env_plugin": "fake_env",
+            "agent_plugin": "fake_agent",
+            "pipeline_plugin": "fake_pipeline",
+            "optimizer_plugin": "fake_optimizer",
+            "ga_seed": 10,
+        }
+
+        def __init__(self, config):
+            self.doin_config = config
+
+        def build_components(self, overrides=None):
+            return object(), object(), object(), dict(self.runtime_config)
+
+        def load_local_optimizer(self, config):
+            return local
+
+    monkeypatch.setattr(trading_optimizer, "AgentMultiRuntime", FakeRuntime)
+    plugin = trading_optimizer.TradingOptimizer()
+    plugin.configure({"ga_seed": 10, "node_seed_offset": 2})
+
+    state = plugin.create_shared_population(4, seed=71)
+    result = plugin.evaluate_candidate(state["population"][0], generation=3)
+    next_state = plugin.reproduce_shared(
+        state["population"], 3, 99, {}, [], {}, 0, 0,
+    )
+
+    assert local.setup_config["ga_seed"] == 10
+    assert local.setup_config["optimization_capture_model_artifact"] is True
+    assert local.setup_config["optimization_require_model_artifact"] is True
+    assert result["fitness"] == pytest.approx(0.2)
+    assert next_state["generation"] == 4
+
+
 def test_local_optimizer_accepts_seed_and_emits_doin_callbacks() -> None:
     from optimizer_plugins.default_optimizer import Plugin
 
