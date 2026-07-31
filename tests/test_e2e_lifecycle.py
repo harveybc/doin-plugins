@@ -607,15 +607,16 @@ class TestFullLifecycle:
         rep = optimizer.reputation.get_score(optimizer.peer_id)
         assert rep > 0
 
-    def test_domain_without_synthetic_gets_zero_weight(self):
-        """A domain without a synthetic data plugin gets zero VUW weight."""
+    def test_domain_without_synthetic_gets_reduced_weight(self):
+        """A domain without synthetic verification remains usable at 0.5x trust."""
         vuw = VerifiedUtilityWeights()
         vuw.register_domain("has-synth", has_synthetic_data=True)
         vuw.register_domain("no-synth", has_synthetic_data=False)
 
         weights = vuw.compute_weights()
         assert weights["has-synth"] > 0
-        assert weights["no-synth"] == 0.0
+        assert 0 < weights["no-synth"] < weights["has-synth"]
+        assert weights["no-synth"] == pytest.approx(weights["has-synth"] * 0.5)
 
     def test_finality_prevents_reorg(self):
         """Finality checkpoints prevent reverting accepted optimae."""

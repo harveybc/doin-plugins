@@ -1,9 +1,9 @@
 """Tests for the predictor domain DON plugins.
 
-These tests verify:
-1. Plugin interface compliance (configure, optimize, evaluate, get_domain_metadata)
-2. Param perturbation logic (bounds respected, int params rounded)
-3. Fitness sign convention (DON higher=better ↔ predictor lower=better)
+These tests verify the current external-predictor wrapper contract:
+1. Plugin interface and metric direction.
+2. Shared-population migration and stage-control callbacks.
+3. Deterministic pre-trained synthetic generator output.
 
 Note: Full integration tests require predictor to be installed with its
 dependencies (TensorFlow, etc.). These unit tests mock the heavy parts.
@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -55,65 +56,67 @@ class TestPredictorOptimizer:
         meta = opt.get_domain_metadata()
         assert "performance_metric" in meta
         assert "higher_is_better" in meta
-        assert meta["higher_is_better"] is True
+        assert meta["higher_is_better"] is False
 
-    def test_random_params_respects_bounds(self):
-        """_random_params generates values within configured bounds."""
+    def test_network_champion_is_consumed_once(self):
+        """A migrated champion is injected once, then removed from local state."""
         opt = PredictorOptimizer()
-        opt._bounds = {
-            "learning_rate": (1e-5, 1e-2),
-            "num_layers": (1, 5),
-            "batch_size": (16, 64),
+        champion = {"learning_rate": 0.001, "window_size": 64}
+        opt.set_network_champion(champion)
+
+        first = opt._on_generation_start([], None, [], 0, {"stage": 1})
+        second = opt._on_generation_start([], None, [], 0, {"stage": 1})
+
+        assert first == champion
+        assert second is None
+
+    def test_force_stage_advance_is_consumed_once(self):
+        """A network stage signal advances exactly one optimizer boundary."""
+        opt = PredictorOptimizer()
+        opt.force_stage_advance()
+
+        assert opt._on_generation_start([], None, [], 2, {"stage": 1}) == {
+            "_force_stage_advance": True,
         }
-        opt._rng = __import__("random").Random(42)
+        assert opt._on_generation_start([], None, [], 2, {"stage": 1}) is None
 
-        for _ in range(50):
-            params = opt._random_params()
-            assert 1e-5 <= params["learning_rate"] <= 1e-2
-            assert 1 <= params["num_layers"] <= 5
-            assert isinstance(params["num_layers"], int)
-            assert 16 <= params["batch_size"] <= 64
-            assert isinstance(params["batch_size"], int)
-
-    def test_perturb_stays_in_bounds(self):
-        """_perturb keeps values clamped within bounds."""
+    def test_between_candidates_calls_service_and_honors_stage_signal(self):
         opt = PredictorOptimizer()
-        opt._bounds = {
-            "learning_rate": (1e-5, 1e-2),
-            "num_layers": (1, 5),
-        }
-        opt._step_frac = 0.5  # Large perturbation
-        opt._rng = __import__("random").Random(42)
+        callback = MagicMock()
+        opt.set_eval_service_callback(callback)
+        opt.force_stage_advance()
 
-        base = {"learning_rate": 5e-3, "num_layers": 3}
-        for _ in range(100):
-            perturbed = opt._perturb(base)
-            assert 1e-5 <= perturbed["learning_rate"] <= 1e-2
-            assert 1 <= perturbed["num_layers"] <= 5
-            assert isinstance(perturbed["num_layers"], int)
+        result = opt._on_between_candidates(
+            3,
+            7,
+            {"total_candidates_evaluated": 19},
+        )
 
-    def test_perturb_handles_missing_base_param(self):
-        """_perturb generates random value when param missing from base."""
+        callback.assert_called_once_with(
+            3,
+            7,
+            {"total_candidates_evaluated": 19},
+        )
+        assert result == {"_force_stage_advance": True}
+        assert opt._total_candidates_evaluated == 19
+
+    def test_last_round_metrics_report_wrapped_optimizer_state(self):
         opt = PredictorOptimizer()
-        opt._bounds = {
-            "learning_rate": (1e-5, 1e-2),
-            "new_param": (0, 10),
-        }
-        opt._step_frac = 0.1
-        opt._rng = __import__("random").Random(42)
+        opt._deap_optimizer = SimpleNamespace(
+            best_fitness_so_far=0.125,
+            best_val_mae_so_far=0.2,
+        )
+        opt._current_generation = 4
+        opt._current_stage = 2
+        opt._total_stages = 5
 
-        base = {"learning_rate": 5e-3}  # new_param not present
-        perturbed = opt._perturb(base)
-        assert "new_param" in perturbed
-        assert 0 <= perturbed["new_param"] <= 10
+        metrics = opt.last_round_metrics
 
-    def test_int_param_detection(self):
-        """_is_int_param correctly identifies int parameters."""
-        opt = PredictorOptimizer()
-        assert opt._is_int_param("batch_size", 16, 64) is True
-        assert opt._is_int_param("num_layers", 1, 5) is True
-        assert opt._is_int_param("learning_rate", 1e-5, 1e-2) is False
-        assert opt._is_int_param("window_size", 24.0, 96.0) is True  # known int param
+        assert metrics["generation"] == 4
+        assert metrics["stage"] == 2
+        assert metrics["total_stages"] == 5
+        assert metrics["champion_fitness"] == pytest.approx(0.125)
+        assert metrics["optimizer_type"] == "deap_ga"
 
 
 class TestPredictorInferencer:
@@ -134,49 +137,42 @@ class TestPredictorSyntheticData:
         from doin_plugins.predictor.synthetic import PredictorSyntheticData
         assert issubclass(PredictorSyntheticData, SyntheticDataPlugin)
 
-    def test_bootstrap_fallback_deterministic(self):
-        """Bootstrap fallback produces identical output for same seed."""
+    @staticmethod
+    def _configured_fake_plugin():
         from doin_plugins.predictor.synthetic import PredictorSyntheticData
 
         plugin = PredictorSyntheticData()
-        plugin._method = "bootstrap"
         plugin._n_samples = 100
-        plugin._block_size = 20
-        plugin._noise_scale = 0.05
+        plugin._hybrid_model = {"model": "fixture"}
 
-        # Create fake real data
-        import pandas as pd
-        n = 500
-        fake_prices = np.cumsum(np.random.randn(n) * 0.001) + 1.3
-        plugin._real_data = {
-            "train": pd.DataFrame({"typical_price": fake_prices}),
-        }
+        def generate(_model, n_samples, *, seed, initial_price):
+            rng = np.random.default_rng(seed)
+            returns = rng.normal(0.0, 0.001, n_samples)
+            return initial_price * np.exp(np.cumsum(returns))
 
-        result1 = plugin._generate_bootstrap(seed=12345)
-        result2 = plugin._generate_bootstrap(seed=12345)
+        plugin._hybrid_generate = generate
+        return plugin
+
+    def test_pretrained_generator_is_deterministic(self):
+        """The loaded-generator path produces identical output for one seed."""
+        plugin = self._configured_fake_plugin()
+
+        result1 = plugin.generate(seed=12345)
+        result2 = plugin.generate(seed=12345)
 
         assert result1["data_hash"] == result2["data_hash"]
         assert result1["n_samples"] == 100
-        assert result1["method"] == "bootstrap"
+        assert result1["method"] == "hmm_hybrid"
 
-        # Different seed → different data
-        result3 = plugin._generate_bootstrap(seed=99999)
+        result3 = plugin.generate(seed=99999)
         assert result3["data_hash"] != result1["data_hash"]
 
     def test_generate_returns_required_fields(self):
         """generate() returns all required dict fields."""
-        from doin_plugins.predictor.synthetic import PredictorSyntheticData
-
-        plugin = PredictorSyntheticData()
-        plugin._method = "bootstrap"
+        plugin = self._configured_fake_plugin()
         plugin._n_samples = 50
-        plugin._block_size = 10
-        plugin._noise_scale = 0.01
 
         import pandas as pd
-        plugin._real_data = {
-            "train": pd.DataFrame({"typical_price": np.ones(200) * 1.3}),
-        }
 
         result = plugin.generate(seed=42)
         assert "synthetic_df" in result
