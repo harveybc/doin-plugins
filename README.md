@@ -117,6 +117,10 @@ print(round(reported, 4), round(verified, 4), data_hash[:16])
 
 ## Using these plugins in a DOIN network
 
+For a complete agent-oriented adaptation path, including exact repository
+paths, local/trusted/untrusted acceptance rungs and a pasteable assignment, see
+[`docs/ADAPT_A_NEW_DOMAIN_WITH_AN_AGENT.md`](docs/ADAPT_A_NEW_DOMAIN_WITH_AN_AGENT.md).
+
 `doin-node` configs reference plugins by entry-point name, for example the
 domain block of
 [doin-node's single-node quadratic example](https://github.com/harveybc/doin-node/blob/master/examples/quadratic_single_node.json):
