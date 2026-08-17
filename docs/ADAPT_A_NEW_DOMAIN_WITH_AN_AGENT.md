@@ -54,23 +54,36 @@ my_domain = "my_doin_adapter.inferencer:MyInferencer"
 my_domain = "my_doin_adapter.synthetic:MySyntheticData"
 ```
 
-3. Install editable packages and prove discovery and independent evaluation:
+3. Install the editable packages. From the directory that contains the sibling
+   repositories, first prove the shipped reference plugin exactly as written:
 
 ```bash
 pip install -e doin-core -e doin-plugins -e <your-optimizer>
 python - <<'PY'
 from doin_core.plugins.loader import load_optimization_plugin, load_inference_plugin
 
-config = {}  # replace with a tiny deterministic fixture
-optimizer = load_optimization_plugin("my_domain")()
-inferencer = load_inference_plugin("my_domain")()
+config = {
+    "n_params": 3,
+    "target": [1.0, -2.0, 0.5],
+    "step_size": 0.25,
+    "seed": 7,
+}
+optimizer = load_optimization_plugin("simple_quadratic")()
+inferencer = load_inference_plugin("simple_quadratic")()
 optimizer.configure(config)
 inferencer.configure(config)
 parameters, reported = optimizer.optimize(None, None)
 verified = inferencer.evaluate(parameters)
+assert abs(reported - verified) < 1e-12, (reported, verified)
 print({"reported": reported, "verified": verified})
 PY
 ```
+
+Then replace `simple_quadratic` with the exact entry-point name you registered
+(`my_domain` in the TOML example) and replace `config` with one tiny,
+deterministic fixture for your optimizer. The optimizer and inferencer must
+receive the same evaluation definition; do not leave a random/default target
+on one side and call the resulting numbers independently verified.
 
 Acceptance: one deterministic fixture, no network, no blockchain, and the
 inferencer recomputes the metric rather than trusting the optimizer's number.
@@ -138,4 +151,3 @@ this metric with other domains unless their units are explicitly comparable.
 Stop before any multi-machine deployment and report files, tests, remaining
 unknowns and the exact next command.
 ```
-
