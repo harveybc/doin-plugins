@@ -12,6 +12,18 @@ and `doin.synthetic_data`, so the unified runtime
 [doin-node](https://github.com/harveybc/doin-node) can discover them by name
 from a per-machine JSON config.
 
+## Research origin
+
+The DOIN family derives from Harvey Demian Bastidas Caicedo's 2018 Master's in
+Engineering thesis at Pontificia Universidad Javeriana Cali, *Computación
+Evolutiva Descentralizada de Modelo Híbrido usando Blockchain y Prueba de
+Trabajo de Optimización*. This repository implements the modern plugin
+boundary added as the original research platform evolved into the current
+`doin-core` protocol library and unified `doin-node` runtime.
+
+Read the original thesis in the doin-core repository:
+[PDF](https://github.com/harveybc/doin-core/blob/master/docs/Hybrid-Model%20Decentralized%20Evolutionary%20Computing%20Using%20Blockchain%20and%20Proof-of-Work%20Optimization.pdf).
+
 ## Role and non-responsibilities
 
 **Role:** concrete plugin implementations — a self-contained quadratic
