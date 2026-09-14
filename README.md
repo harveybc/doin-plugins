@@ -88,6 +88,15 @@ The plugin families:
   `agent-multi --load_config` uses. The local optimizer remains in
   agent-multi; this package never replaces it.
 
+## Use with a coding agent
+
+> Read AGENTS.md, this README and pyproject.toml. In an isolated environment,
+> exercise the simple_quadratic reference plugins first. Show the discovered
+> entry points, deterministic inputs, optimizer result and verifier outcome.
+> Do not start network nodes, financial training or live execution. When
+> inspecting an external-domain adapter, report its actual dependency and
+> whether the call path is implemented; do not infer integration from imports.
+
 ## Requirements
 
 From [`pyproject.toml`](pyproject.toml):
