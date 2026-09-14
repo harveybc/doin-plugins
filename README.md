@@ -1,5 +1,19 @@
 # doin-plugins
 
+## Current research integration
+
+The default branch contains the plugin implementations described below.
+An [additional eligibility-adapter research snapshot](https://github.com/harveybc/doin-plugins/tree/10f6026981c3979bd95672ac39a9343dd6f18998)
+is published separately; it depends on the matching predictor research code.
+An adapter existing in source does not establish a wired trading-domain
+publication path or end-to-end governed DOIN execution.
+
+[Data-gov](https://github.com/harveybc/data-gov) handles dataset provenance and
+experiment accounting; DOIN provides distributed optimization infrastructure.
+Their result identities must be connected without counting one experiment
+twice. This integration is work in progress, not a property of every plugin.
+See the [research repository map](https://github.com/harveybc/predictor/blob/master/docs/RESEARCH_STACK.md).
+
 **Status: ACTIVE — component of the DOIN family.**
 
 `doin-plugins` provides the reusable plugin **implementations** for DOIN, the
