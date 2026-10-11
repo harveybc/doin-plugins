@@ -30,6 +30,11 @@ from doin_core.plugins.base import OptimizationPlugin
 # Activation mapping (must match predictor's default_optimizer)
 ACTIVATIONS = ["relu", "elu", "selu", "tanh", "sigmoid", "swish", "gelu", "leaky_relu"]
 
+# I6-N swarm mode (optimization_config contains "i6n_swarm"): shared-population
+# only, raw minimization, campaign seed 6102026 in role, DEAP and publication.
+I6N_SEED = 6102026
+I6N_PLUGIN = "i6n_optimizer"
+
 
 class PredictorOptimizer(OptimizationPlugin):
     """DOIN optimization plugin that wraps predictor's DEAP GA optimizer.
@@ -78,8 +83,14 @@ class PredictorOptimizer(OptimizationPlugin):
         self._last_gen_stats: dict[str, Any] = {}
         self._is_running: bool = False
 
+        # I6-N swarm mode state (None in every other mode)
+        self._i6n: dict[str, Any] | None = None
+
     def configure(self, config: dict[str, Any]) -> None:
         self._config = config
+        if config.get("i6n_swarm") is not None:
+            self._configure_i6n_swarm(config)
+            return
 
         # Resolve predictor repo
         root = config.get("predictor_root")
@@ -161,6 +172,76 @@ class PredictorOptimizer(OptimizationPlugin):
             from optimizer_plugins.default_optimizer import Plugin as DeapOptimizer
             self._deap_optimizer = DeapOptimizer()
         self._deap_optimizer.set_params(**self._predictor_config)
+
+    # ── I6-N swarm mode ──────────────────────────────────────
+
+    def _configure_i6n_swarm(self, config: dict[str, Any]) -> None:
+        """Shared-only I6N mode: no model/data plugin imports, no optimizer fallback.
+
+        The evaluator never runs in this process: each fold is one admitted
+        crispdm-run child launched by tools.i6n_swarm.bridge, guarded by the
+        campaign ledger's leases and fencing tokens.
+        """
+        swarm = config["i6n_swarm"]
+        if config.get("optimizer_plugin") != I6N_PLUGIN and not str(config.get("optimizer_plugin", "")).startswith("i6n"):
+            raise ValueError("i6n_swarm mode requires optimizer_plugin=i6n_optimizer")
+        if config.get("higher_is_better", False) is not False:
+            raise ValueError("i6n_swarm mode is raw minimization (higher_is_better=False)")
+        for key in ("shared_population_seed",):
+            if config.get(key, I6N_SEED) != I6N_SEED:
+                raise ValueError(f"i6n_swarm {key} must be {I6N_SEED}")
+        if swarm.get("seed", I6N_SEED) != I6N_SEED:
+            raise ValueError(f"i6n_swarm seed must be {I6N_SEED}")
+        root = config.get("predictor_root")
+        if not root:
+            raise ValueError("i6n_swarm mode requires an explicit predictor_root")
+        self._predictor_root = Path(root).expanduser().resolve()
+        if str(self._predictor_root) not in sys.path:
+            sys.path.insert(0, str(self._predictor_root))
+        self._predictor_config = {k: copy.deepcopy(v) for k, v in config.items()
+                                  if k not in ("predictor_root", "load_config", "optimization_callbacks")}
+        from app.plugin_loader import load_plugin  # predictor's resolver; no TensorFlow import
+
+        try:
+            cls, _ = load_plugin("optimizer.plugins", config["optimizer_plugin"])
+        except BaseException as exc:  # includes the resolver's SystemExit refusal
+            raise RuntimeError(f"i6n_swarm: optimizer plugin {config['optimizer_plugin']!r} unavailable; "
+                               f"no default_optimizer fallback ({exc})") from None
+        if not cls.__module__.endswith("i6n_optimizer"):
+            raise RuntimeError(f"i6n_swarm: resolved {cls.__module__}, not the I6N plugin")
+        self._deap_optimizer = cls()
+        self._deap_optimizer.set_params(**self._predictor_config)
+        node = json.loads(Path(swarm["node_config"]).read_text())
+        self._i6n = dict(swarm=copy.deepcopy(swarm), node=node, bridge=None, ledger=None)
+
+    def _i6n_ledger(self):
+        if self._i6n["ledger"] is None:
+            from tools.i6n_swarm import bridge as i6n_bridge
+
+            self._i6n["ledger"] = i6n_bridge.open_ledger(self._i6n["node"])
+        return self._i6n["ledger"]
+
+    def _i6n_bridge(self):
+        if self._i6n["bridge"] is None:
+            from tools.i6n_swarm import agent as i6n_agent, bridge as i6n_bridge
+
+            node = self._i6n["node"]
+            self._i6n["bridge"] = i6n_bridge.Bridge(node, self._i6n_ledger(), admit=i6n_agent.make_admit(node))
+        return self._i6n["bridge"]
+
+    def _i6n_persist(self, state: dict[str, Any], generation: int) -> None:
+        snapshot = {k: v for k, v in state.items() if k not in ("config_snapshot", "node_seed_ignored")}
+        self._i6n_ledger().put_search_state(self._i6n["swarm"]["dag_node"], int(generation),
+                                            json.loads(json.dumps(snapshot, default=str)))
+
+    def validate_domain_role(self, role: dict[str, Any]) -> None:
+        """Called by the DOIN node before shared optimization: role, wrapper and DEAP must agree."""
+        if self._i6n is None:
+            return
+        if role.get("higher_is_better") is not False:
+            raise ValueError("I6N domain role must be minimizing (higher_is_better=False)")
+        if role.get("shared_population_seed") != I6N_SEED:
+            raise ValueError(f"I6N domain role seed must be {I6N_SEED}")
 
     # ── DOIN Integration Points ──────────────────────────────
 
@@ -359,6 +440,16 @@ class PredictorOptimizer(OptimizationPlugin):
 
     def get_domain_metadata(self) -> dict[str, Any]:
         """Return metadata about the predictor optimization domain."""
+        if self._i6n is not None:
+            return {
+                "performance_metric": "fitness",
+                "higher_is_better": False,
+                "direction": "minimize",
+                "seed": I6N_SEED,
+                "mode": "i6n_swarm",
+                "domain_type": "predictor-timeseries",
+                "optimizer": "I6N shared DEAP: 80% conditional mutation / 20% immigration, no crossover",
+            }
         return {
             "performance_metric": "fitness",
             "higher_is_better": False,  # predictor: lower fitness = better
@@ -421,6 +512,12 @@ class PredictorOptimizer(OptimizationPlugin):
         """
         self.setup_shared_mode()
         opt_config = self.get_shared_opt_config()
+        if self._i6n is not None:
+            if seed != I6N_SEED:
+                raise ValueError(f"I6N bootstrap seed {seed} differs from the campaign seed {I6N_SEED}")
+            state = self._deap_optimizer.create_shared_population(population_size, opt_config, seed=seed)
+            self._i6n_persist(state, 0)
+            return state
         return self._deap_optimizer.create_shared_population(population_size, opt_config, seed=seed)
 
     def evaluate_candidate(self, genome_serialized: dict, generation: int) -> dict[str, Any]:
@@ -430,6 +527,10 @@ class PredictorOptimizer(OptimizationPlugin):
         """
         self.setup_shared_mode()
         opt_config = self.get_shared_opt_config()
+        if self._i6n is not None:
+            # Fold fan-out, ledger fencing and admitted subprocesses; raises instead of inventing a score.
+            return self._i6n_bridge().evaluate_wire(genome_serialized, generation,
+                                                    opt_config["i6n_evaluation_context"])
         return self._deap_optimizer.evaluate_single_genome(genome_serialized, generation, opt_config)
 
     def reproduce_shared(
@@ -448,6 +549,23 @@ class PredictorOptimizer(OptimizationPlugin):
         Returns dict with next population + updated state.
         """
         opt_config = self.get_shared_opt_config()
+        if self._i6n is not None:
+            # The node derives its seed from a results hash; I6N reproduction is seeded only by the
+            # campaign seed and generation, so every node and every restart proposes the same offspring.
+            campaign_seed = I6N_SEED + int(generation) + 1
+            result = self._deap_optimizer.reproduce_shared(
+                evaluated_pop, generation, campaign_seed, opt_config,
+                innovation_tracker_data, stage_schedule,
+                param_defaults, current_stage_idx, no_improve_count,
+            )
+            result["seed_used"] = campaign_seed
+            result["node_seed_ignored"] = seed
+            self._i6n_persist(result, result.get("generation", generation + 1))
+            if result.get("converged"):
+                self._i6n_ledger().dag_event(self._i6n["swarm"]["dag_node"], "SEARCH_TERMINAL", {
+                    "stop_reason": result.get("stop_reason"), "generation": generation,
+                    "seed": I6N_SEED, "direction": "minimize"})
+            return result
         return self._deap_optimizer.reproduce_shared(
             evaluated_pop, generation, seed, opt_config,
             innovation_tracker_data, stage_schedule,
