@@ -167,3 +167,24 @@ def test_reproduction_seed_is_campaign_derived_and_terminal_is_recorded(setup):
     events = led.dag_events("search:h12")
     assert events and events[0]["event"] == "SEARCH_TERMINAL"
     assert events[0]["detail"]["stop_reason"] == last["stop_reason"]
+
+
+def test_node_loss_during_reproduction_recomputes_identically_without_refits(setup):
+    """A node dies after its generation's fits but before reproduction completes."""
+    config, counts, ledger_path = setup
+    first = configured(config)
+    state = first.create_shared_population(2, seed=I6N_SEED)
+    results = [first.evaluate_candidate(w, 0) for w in state["population"]]
+    fits_before = len(os.listdir(counts))
+    del first  # lost during reproduce: nothing for generation 1 was persisted
+    assert L.Ledger(ledger_path).search_state("search:h12")["generation"] == 0
+    restarted = configured(config)
+    again = [restarted.evaluate_candidate(w, 0) for w in state["population"]]
+    assert [r["fitness"] for r in again] == [r["fitness"] for r in results]
+    assert len(os.listdir(counts)) == fits_before  # adopted from the ledger, never refit
+    evaluated = [dict(w, fitness=r["fitness"]) for w, r in zip(state["population"], again)]
+    args = (state["innovation_tracker"], state["stage_schedule"], state["param_defaults"], 0, 0)
+    a = restarted.reproduce_shared(evaluated, 0, 1, *args)
+    b = configured(config).reproduce_shared(evaluated, 0, 2, *args)  # a peer recomputes the same generation
+    assert a["population"] == b["population"] and a["generation"] == 1
+    assert L.Ledger(ledger_path).search_state("search:h12")["generation"] == 1
