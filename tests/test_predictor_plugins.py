@@ -144,6 +144,22 @@ class TestPredictorOptimizer:
         with pytest.raises(RuntimeError, match="explicit terminal"):
             opt.get_terminal_receipt()
 
+    def test_runtime_statistics_are_forwarded_without_aliasing(self):
+        opt = PredictorOptimizer()
+        expected = {
+            "candidate_evaluations_total": 11,
+            "candidate_history_source": "i6n:h4:gamma-5090",
+        }
+        opt._deap_optimizer = SimpleNamespace(
+            get_runtime_statistics=lambda: dict(expected)
+        )
+
+        statistics = opt.get_runtime_statistics()
+
+        assert statistics == expected
+        statistics["candidate_evaluations_total"] = 999
+        assert opt.get_runtime_statistics() == expected
+
 
 class TestPredictorInferencer:
     """Tests for PredictorInferencer."""

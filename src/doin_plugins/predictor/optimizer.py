@@ -381,6 +381,16 @@ class PredictorOptimizer(OptimizationPlugin):
             raise RuntimeError("I6N optimizer returned an invalid terminal")
         return copy.deepcopy(terminal)
 
+    def get_runtime_statistics(self) -> dict[str, Any]:
+        """Forward durable runtime counters from the predictor optimizer."""
+        getter = getattr(self._deap_optimizer, "get_runtime_statistics", None)
+        if not callable(getter):
+            return {}
+        statistics = getter() or {}
+        if not isinstance(statistics, dict):
+            raise RuntimeError("predictor optimizer returned invalid runtime statistics")
+        return copy.deepcopy(statistics)
+
     # ── Metrics Properties ───────────────────────────────────
 
     def get_domain_metadata(self) -> dict[str, Any]:
