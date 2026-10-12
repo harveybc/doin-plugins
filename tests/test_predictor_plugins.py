@@ -118,6 +118,32 @@ class TestPredictorOptimizer:
         assert metrics["champion_fitness"] == pytest.approx(0.125)
         assert metrics["optimizer_type"] == "deap_ga"
 
+    def test_island_terminal_is_forwarded_without_aliasing(self):
+        opt = PredictorOptimizer()
+        expected = {
+            "status": "COMPLETE",
+            "island_id": "gamma-5090",
+            "terminal_generation": 31,
+        }
+        opt._predictor_config = {"i6n_island_mode": True}
+        opt._deap_optimizer = SimpleNamespace(
+            island_terminal=lambda: dict(expected)
+        )
+
+        receipt = opt.get_terminal_receipt()
+
+        assert receipt == expected
+        receipt["status"] = "TAMPERED"
+        assert opt.get_terminal_receipt() == expected
+
+    def test_island_terminal_is_never_inferred_from_legacy_optimizer_state(self):
+        opt = PredictorOptimizer()
+        opt._predictor_config = {"i6n_island_mode": True}
+        opt._deap_optimizer = SimpleNamespace(best_fitness_so_far=-0.1)
+
+        with pytest.raises(RuntimeError, match="explicit terminal"):
+            opt.get_terminal_receipt()
+
 
 class TestPredictorInferencer:
     """Tests for PredictorInferencer."""

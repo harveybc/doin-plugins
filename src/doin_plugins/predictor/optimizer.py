@@ -367,6 +367,20 @@ class PredictorOptimizer(OptimizationPlugin):
 
         return best_hyper, performance
 
+    def get_terminal_receipt(self) -> dict[str, Any] | None:
+        """Return the predictor island terminal without inferring convergence."""
+        if not self._predictor_config.get("i6n_island_mode", False):
+            return None
+        getter = getattr(self._deap_optimizer, "island_terminal", None)
+        if not callable(getter):
+            raise RuntimeError("I6N optimizer does not expose an explicit terminal")
+        terminal = getter()
+        if terminal is None:
+            return None
+        if not isinstance(terminal, dict):
+            raise RuntimeError("I6N optimizer returned an invalid terminal")
+        return copy.deepcopy(terminal)
+
     # ── Metrics Properties ───────────────────────────────────
 
     def get_domain_metadata(self) -> dict[str, Any]:
