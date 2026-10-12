@@ -192,6 +192,11 @@ class PredictorOptimizer(OptimizationPlugin):
                 raise ValueError(f"i6n_swarm {key} must be {I6N_SEED}")
         if swarm.get("seed", I6N_SEED) != I6N_SEED:
             raise ValueError(f"i6n_swarm seed must be {I6N_SEED}")
+        plan = config.get("i6n_plan")
+        if not isinstance(plan, dict) or plan.get("seed") != I6N_SEED:
+            raise ValueError("i6n_swarm requires the sealed I6N search plan (i6n_plan) with seed 6102026")
+        if not isinstance(swarm.get("context"), dict) or swarm["context"].get("plan_sha256") != plan.get("plan_sha256"):
+            raise ValueError("i6n_swarm.context must be bound to the sealed plan")
         root = config.get("predictor_root")
         if not root:
             raise ValueError("i6n_swarm mode requires an explicit predictor_root")
@@ -226,7 +231,8 @@ class PredictorOptimizer(OptimizationPlugin):
             from tools.i6n_swarm import agent as i6n_agent, bridge as i6n_bridge
 
             node = self._i6n["node"]
-            self._i6n["bridge"] = i6n_bridge.Bridge(node, self._i6n_ledger(), admit=i6n_agent.make_admit(node))
+            self._i6n["bridge"] = i6n_bridge.Bridge(node, self._i6n_ledger(), admit=i6n_agent.make_admit(node),
+                                                    plan=self._predictor_config["i6n_plan"])
         return self._i6n["bridge"]
 
     def _i6n_persist(self, state: dict[str, Any], generation: int) -> None:
@@ -529,8 +535,7 @@ class PredictorOptimizer(OptimizationPlugin):
         opt_config = self.get_shared_opt_config()
         if self._i6n is not None:
             # Fold fan-out, ledger fencing and admitted subprocesses; raises instead of inventing a score.
-            return self._i6n_bridge().evaluate_wire(genome_serialized, generation,
-                                                    opt_config["i6n_evaluation_context"])
+            return self._i6n_bridge().evaluate_wire(genome_serialized, generation, self._i6n["swarm"]["context"])
         return self._deap_optimizer.evaluate_single_genome(genome_serialized, generation, opt_config)
 
     def reproduce_shared(
@@ -550,15 +555,14 @@ class PredictorOptimizer(OptimizationPlugin):
         """
         opt_config = self.get_shared_opt_config()
         if self._i6n is not None:
-            # The node derives its seed from a results hash; I6N reproduction is seeded only by the
-            # campaign seed and generation, so every node and every restart proposes the same offspring.
-            campaign_seed = I6N_SEED + int(generation) + 1
+            # The node derives its seed from a results hash; I6N reproduction always receives the plan seed
+            # unchanged: E's v2 path derives its RNG per horizon and generation from it (E-B2).
             result = self._deap_optimizer.reproduce_shared(
-                evaluated_pop, generation, campaign_seed, opt_config,
+                evaluated_pop, generation, I6N_SEED, opt_config,
                 innovation_tracker_data, stage_schedule,
                 param_defaults, current_stage_idx, no_improve_count,
             )
-            result["seed_used"] = campaign_seed
+            result["seed_used"] = I6N_SEED
             result["node_seed_ignored"] = seed
             self._i6n_persist(result, result.get("generation", generation + 1))
             if result.get("converged"):

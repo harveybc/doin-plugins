@@ -3,6 +3,9 @@
 Uses the REAL wrapper, the REAL predictor plugin loader and the REAL I6N DEAP
 plugin from a predictor checkout (I6N_PREDICTOR_ROOT), with a fake evaluator
 subprocess on CPU and a throwaway ledger. No TensorFlow, no data, no node.
+
+Pinned dependency: verified with doin-core a90bca2c (OptimizationPlugin base). Set
+DOIN_CORE_EXPECTED_COMMIT to make the run refuse any other doin-core checkout.
 """
 from __future__ import annotations
 
@@ -20,6 +23,17 @@ if not (PREDICTOR / "tools" / "i6n_swarm" / "bridge.py").exists():
 if str(PREDICTOR) not in sys.path:
     sys.path.insert(0, str(PREDICTOR))
 
+import doin_core  # noqa: E402
+
+_EXPECTED_CORE = os.environ.get("DOIN_CORE_EXPECTED_COMMIT")
+if _EXPECTED_CORE:
+    import subprocess as _sp
+
+    _core = Path(doin_core.__file__).resolve().parents[2]
+    _head = _sp.run(["git", "-C", str(_core), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    if not _head.startswith(_EXPECTED_CORE):
+        raise RuntimeError(f"doin-core at {_head}, expected {_EXPECTED_CORE}")
+
 from doin_plugins.predictor.optimizer import I6N_SEED, PredictorOptimizer  # noqa: E402
 from tools import i6n_search as search  # noqa: E402
 from tools.i6n_swarm import common, ledger as L  # noqa: E402
@@ -27,16 +41,23 @@ from tools.i6n_swarm import common, ledger as L  # noqa: E402
 FAKE = r'''
 import json, os, sys, hashlib
 req = json.load(sys.stdin)
-open(os.path.join(os.environ["FAKE_COUNT_DIR"], "%s-%d" % (req["context"]["fold"], len(os.listdir(os.environ["FAKE_COUNT_DIR"])))), "w").write("x")
+ctx = req["context"]
+open(os.path.join(os.environ["FAKE_COUNT_DIR"], "%s-%d" % (ctx["fold"], len(os.listdir(os.environ["FAKE_COUNT_DIR"])))), "w").write("x")
 d = lambda v: hashlib.sha256(json.dumps(v, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 gid = hashlib.sha256(json.dumps({"schema": "i6n-search-v1", "config": req["config"]}, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii")).hexdigest()
 s = req["support"]
+h = req["config"]["horizon"]
+rows = [dict(head_offset_hours=h, head_role="ENDPOINT", comparison=True, split=sp.upper(), support_sha256=ctx["origins"][sp])
+        for sp in ("train", "inner")]
 print(json.dumps(dict(status="ok", counts=s["counts"], naive_sums=s["naive_sums"], support_digest=s["support_digest"],
     error_sums={k: v * 0.9 for k, v in s["naive_sums"].items()},
-    metadata=dict(candidate_receipt=dict(schema_version="i6n.candidate_receipt.v1", experiment="exp", fold=req["context"]["fold"],
-        effective_config_sha256=d(req["config"]), horizon_hours=req["config"]["horizon"], genotype_canonical_sha256=gid,
-        seed=6102026, rows=[])))))
+    metadata=dict(candidate_receipt=dict(schema_version="i6n.candidate_receipt.v1", experiment="exp", fold=ctx["fold"],
+        effective_config_sha256=d(req["config"]), horizon_hours=h, genotype_canonical_sha256=gid,
+        seed=6102026, rows=rows)))))
 '''
+
+E_PLAN = json.loads((PREDICTOR / "docs" / "i6n" / "swarm" / "I6N_SEARCH_PLAN_v1_2.json").read_text())
+FOLDS = ("2023Q1_DCA", "2023Q2_DCA", "2023Q3_DCA", "2023Q4")
 
 
 def support(scale):
@@ -46,6 +67,9 @@ def support(scale):
 
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
+    """Config rendered by predictor's real campaign renderer (E's v2 path, sealed plan v1.2)."""
+    from tools.i6n_swarm import plan as P
+
     (tmp_path / "fake.py").write_text(FAKE)
     counts = tmp_path / "counts"
     counts.mkdir()
@@ -60,18 +84,18 @@ def setup(tmp_path, monkeypatch):
                 ledger=dict(path=str(ledger_path)), logs_dir=str(tmp_path / "logs"), state_dir=str(tmp_path / "state"))
     node_path = tmp_path / "node.json"
     node_path.write_text(json.dumps(node))
-    folds = [dict(fold=f, context=dict(fold=f), support=support(i + 1), binding_sha256=None)
-             for i, f in enumerate(("2023Q1", "2023Q2"))]
-    context = dict(schema="i6n.swarm.context.v1", experiment="exp", plan_sha256="p" * 64, horizon=12,
-                   dag_node="search:h12", fixture=True, budget_new_candidates=4, classes=[], folds=folds)
-    fold_set = dict(counts=dict(train=200, inner=20), naive_sums=dict(train=3.0, inner=0.3),
-                    support_digest=dict(train="a" * 64, inner="b" * 64))
-    config = dict(predictor_root=str(PREDICTOR), optimizer_plugin="i6n_optimizer", shared_population=True,
-                  shared_population_size=2, shared_population_seed=I6N_SEED, n_generations=3,
-                  optimization_patience=3, improvement_tolerance=1e-4, reproduction_failure_policy="fail_closed",
-                  higher_is_better=False, i6n_budget=4, i6n_max_proposals=128, i6n_horizon=12,
-                  i6n_support=fold_set, i6n_evaluation_context=context,
-                  i6n_swarm=dict(node_config=str(node_path), horizon=12, dag_node="search:h12", seed=I6N_SEED))
+    folds = []
+    for i, f in enumerate(FOLDS):
+        origins = dict(train=common.sha256_json(["ot", f]), inner=common.sha256_json(["oi", f]))
+        folds.append(dict(fold=f, context=dict(fold=f, origins=origins), support=support(i + 1), binding_sha256=None,
+                          origins_sha256=origins))
+    context = dict(schema="i6n.swarm.context.v1", experiment="exp", plan_sha256=E_PLAN["plan_sha256"], horizon=12,
+                   dag_node="search:h12", fixture=True, budget_new_candidates=24, classes=[], folds=folds)
+    template = dict(campaign_id="fx", node_label="x", port=1, data_dir=str(tmp_path), bootstrap_peers=[],
+                    shared_min_peers=2, claim_timeout=600, predictor_root=str(PREDICTOR), node_config=str(node_path),
+                    search=dict(population_size=8, generations=3, new_candidates_per_horizon=24, mutation=0.8,
+                                immigration=0.2, tolerance=1e-4, patience=3), e_plan=E_PLAN, admitted_classes=["S1"])
+    config = P.render_doin_config(template, {"12": context})["domains"][0]["optimization_config"]
     return config, counts, ledger_path
 
 
@@ -100,7 +124,7 @@ def test_no_silent_default_optimizer_fallback(setup, tmp_path):
     assert "i6n" in str(info.value).lower()
 
 
-@pytest.mark.parametrize("key,value", [("shared_population_seed", 42), ("higher_is_better", True)])
+@pytest.mark.parametrize("key,value", [("shared_population_seed", 42), ("higher_is_better", True), ("i6n_plan", None)])
 def test_seed_and_direction_must_agree_in_config(setup, key, value):
     config, _, _ = setup
     with pytest.raises(ValueError):
@@ -121,8 +145,8 @@ def test_population_requires_campaign_seed_and_is_persisted(setup):
     plugin = configured(config)
     with pytest.raises(ValueError, match="6102026"):
         plugin.create_shared_population(2, seed=42)
-    state = plugin.create_shared_population(2, seed=I6N_SEED)
-    assert 1 <= len(state["population"]) <= 2
+    state = plugin.create_shared_population(8, seed=I6N_SEED)
+    assert {w["schema"] for w in state["population"]} == {"i6n-shared-deap-v2"}
     stored = L.Ledger(ledger_path).search_state("search:h12")
     assert stored["generation"] == 0 and stored["state"]["population"] == state["population"]
 
@@ -130,7 +154,7 @@ def test_population_requires_campaign_seed_and_is_persisted(setup):
 def test_evaluation_in_node_thread_uses_folds_and_never_refits(setup):
     config, counts, _ = setup
     plugin = configured(config)
-    state = plugin.create_shared_population(2, seed=I6N_SEED)
+    state = plugin.create_shared_population(8, seed=I6N_SEED)
     wire = state["population"][0]
     box = {}
     worker = threading.Thread(target=lambda: box.update(result=plugin.evaluate_candidate(wire, 0)))
@@ -140,21 +164,22 @@ def test_evaluation_in_node_thread_uses_folds_and_never_refits(setup):
     assert result["fitness"] == pytest.approx(0.9)
     assert result["candidate_identity"] == wire["identity"]
     assert result["hyper_dict"] == search.effective_config(wire["genome"])
-    assert len(os.listdir(counts)) == 2
+    assert result["metrics"]["origins_binding"] == "VERIFIED" and result["metrics"]["aggregator"] == "E.score_folds"
+    assert len(os.listdir(counts)) == 4
     again = configured(config).evaluate_candidate(wire, 0)
-    assert again["fitness"] == result["fitness"] and len(os.listdir(counts)) == 2
+    assert again["fitness"] == result["fitness"] and len(os.listdir(counts)) == 4
 
 
 def test_reproduction_seed_is_campaign_derived_and_terminal_is_recorded(setup):
     config, _, ledger_path = setup
     plugin = configured(config)
-    state = plugin.create_shared_population(2, seed=I6N_SEED)
+    state = plugin.create_shared_population(8, seed=I6N_SEED)
     evaluated = [dict(w, fitness=0.5 + i / 10) for i, w in enumerate(state["population"])]
     args = (state["innovation_tracker"], state["stage_schedule"], state["param_defaults"], 0, 0)
     a = plugin.reproduce_shared(evaluated, 0, 111, *args)
     b = configured(config).reproduce_shared(evaluated, 0, 999, *args)
     assert a["population"] == b["population"]
-    assert a["seed_used"] == I6N_SEED + 1 and a["node_seed_ignored"] == 111
+    assert a["seed_used"] == I6N_SEED and a["node_seed_ignored"] == 111
     led = L.Ledger(ledger_path)
     assert led.search_state("search:h12")["generation"] == 1
     last = a
@@ -173,7 +198,7 @@ def test_node_loss_during_reproduction_recomputes_identically_without_refits(set
     """A node dies after its generation's fits but before reproduction completes."""
     config, counts, ledger_path = setup
     first = configured(config)
-    state = first.create_shared_population(2, seed=I6N_SEED)
+    state = first.create_shared_population(8, seed=I6N_SEED)
     results = [first.evaluate_candidate(w, 0) for w in state["population"]]
     fits_before = len(os.listdir(counts))
     del first  # lost during reproduce: nothing for generation 1 was persisted
@@ -188,3 +213,41 @@ def test_node_loss_during_reproduction_recomputes_identically_without_refits(set
     b = configured(config).reproduce_shared(evaluated, 0, 2, *args)  # a peer recomputes the same generation
     assert a["population"] == b["population"] and a["generation"] == 1
     assert L.Ledger(ledger_path).search_state("search:h12")["generation"] == 1
+
+
+def test_e_b1_e_b2_v2_population_has_minimal_seed_and_reproduction_keeps_the_plan_seed(setup):
+    from tools import i6n_search_space as space
+    config, _, _ = setup
+    plugin = configured(config)
+    state = plugin.create_shared_population(8, seed=I6N_SEED)
+    assert space.genotype_sha256(space.seed_genotype(12)) in [w["identity"] for w in state["population"]]
+    assert {space.class_of(w["genotype"]) for w in state["population"]} == {"S1"}
+    evaluated = [dict(w, fitness=1.0 + i / 100) for i, w in enumerate(state["population"])]
+    out = plugin.reproduce_shared(evaluated, 0, 987654, state["innovation_tracker"], state["stage_schedule"],
+                                  state["param_defaults"], 0, 0)  # E's v2 refuses any seed but the plan seed
+    assert out["seed_used"] == I6N_SEED and out["generation"] == 1
+
+
+def test_e_b11_disconnect_mid_reproduction_resumes_from_search_state(setup, monkeypatch):
+    """The ledger becomes unreachable while a node persists generation 1: reproduction raises and nothing
+    is half-written; the restarted node (or a peer) recomputes the same generation and persists it once."""
+    config, counts, ledger_path = setup
+    first = configured(config)
+    state = first.create_shared_population(8, seed=I6N_SEED)
+    evaluated = [dict(w, fitness=0.7 + i / 100) for i, w in enumerate(state["population"])]
+    args = (state["innovation_tracker"], state["stage_schedule"], state["param_defaults"], 0, 0)
+    ledger = first._i6n_ledger()
+
+    def down(*a, **k):
+        raise ConnectionError("ledger unreachable")
+    monkeypatch.setattr(ledger, "put_search_state", down)
+    with pytest.raises(ConnectionError):
+        first.reproduce_shared(evaluated, 0, 1, *args)
+    assert L.Ledger(ledger_path).search_state("search:h12")["generation"] == 0
+    restarted = configured(config)
+    a = restarted.reproduce_shared(evaluated, 0, 2, *args)
+    b = configured(config).reproduce_shared(evaluated, 0, 3, *args)
+    assert a["population"] == b["population"]
+    stored = L.Ledger(ledger_path).search_state("search:h12")
+    assert stored["generation"] == 1 and stored["state"]["population"] == a["population"]
+    assert os.listdir(counts) == []  # reproduction never fits
