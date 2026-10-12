@@ -106,7 +106,8 @@ class PredictorOptimizer(OptimizationPlugin):
             sys.path.insert(0, root_str)
 
         self._load_predictor_config()
-        self._load_plugins()
+        if not self._predictor_config.get("i6n_island_mode", False):
+            self._load_plugins()
         self._load_deap_optimizer()
 
     def _load_predictor_config(self) -> None:
@@ -152,11 +153,16 @@ class PredictorOptimizer(OptimizationPlugin):
     def _load_deap_optimizer(self) -> None:
         """Load predictor's optimizer plugin (default_optimizer or neat_optimizer)."""
         optimizer_name = self._predictor_config.get("optimizer_plugin", "default_optimizer")
+        island_mode = self._predictor_config.get("i6n_island_mode", False)
+        if island_mode and optimizer_name != "i6n_optimizer":
+            raise ValueError("i6n_island_mode requires optimizer_plugin=i6n_optimizer")
         try:
             from app.plugin_loader import load_plugin
             OptClass, _ = load_plugin("optimizer.plugins", optimizer_name)
             self._deap_optimizer = OptClass()
         except Exception:
+            if island_mode:
+                raise
             # Fallback to default_optimizer if plugin loading fails
             from optimizer_plugins.default_optimizer import Plugin as DeapOptimizer
             self._deap_optimizer = DeapOptimizer()
@@ -342,15 +348,21 @@ class PredictorOptimizer(OptimizationPlugin):
             import traceback
             traceback.print_exc()
             self._is_running = False
+            if opt_config.get("i6n_island_mode", False):
+                raise
             return None
         finally:
             self._is_running = False
 
         if best_hyper is None:
+            if opt_config.get("i6n_island_mode", False):
+                raise RuntimeError("I6N island optimizer returned no champion")
             return None
 
         # Get final champion fitness from the optimizer
         fitness = getattr(self._deap_optimizer, "best_fitness_so_far", float("inf"))
+        if opt_config.get("i6n_island_mode", False) and not np.isfinite(fitness):
+            raise RuntimeError("I6N island optimizer returned non-finite fitness")
         performance = fitness  # Raw fitness; unified node uses higher_is_better to compare
 
         return best_hyper, performance
