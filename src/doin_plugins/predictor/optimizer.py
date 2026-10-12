@@ -522,6 +522,18 @@ class PredictorOptimizer(OptimizationPlugin):
             if seed != I6N_SEED:
                 raise ValueError(f"I6N bootstrap seed {seed} differs from the campaign seed {I6N_SEED}")
             state = self._deap_optimizer.create_shared_population(population_size, opt_config, seed=seed)
+            persisted = self._i6n_ledger().search_state(self._i6n["swarm"]["dag_node"])
+            if persisted is not None and persisted["generation"] > 0:
+                # A node joining mid-run (or restarting without chain state) enters the swarm's CURRENT
+                # generation from the durable ledger, never a stale genesis it would wait on forever.
+                current = copy.deepcopy(persisted["state"])
+                if current.get("converged") or not current.get("population"):
+                    raise ValueError("I6N search already terminal in the ledger: nothing to join")
+                current["generation"] = persisted["generation"]
+                current.setdefault("stage_idx", 0)
+                current.setdefault("no_improve_count", 0)
+                current["resumed_from_ledger"] = True
+                return current
             self._i6n_persist(state, 0)
             return state
         return self._deap_optimizer.create_shared_population(population_size, opt_config, seed=seed)

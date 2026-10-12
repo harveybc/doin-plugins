@@ -251,3 +251,17 @@ def test_e_b11_disconnect_mid_reproduction_resumes_from_search_state(setup, monk
     stored = L.Ledger(ledger_path).search_state("search:h12")
     assert stored["generation"] == 1 and stored["state"]["population"] == a["population"]
     assert os.listdir(counts) == []  # reproduction never fits
+
+
+
+def test_late_joiner_enters_the_current_generation_from_the_ledger(setup):
+    config, _, ledger_path = setup
+    first = configured(config)
+    state = first.create_shared_population(8, seed=I6N_SEED)
+    evaluated = [dict(w, fitness=0.7 + i / 100) for i, w in enumerate(state["population"])]
+    gen1 = first.reproduce_shared(evaluated, 0, 1, state["innovation_tracker"], state["stage_schedule"],
+                                  state["param_defaults"], 0, 0)
+    joiner = configured(config).create_shared_population(8, seed=I6N_SEED)
+    assert joiner["generation"] == 1 and joiner["resumed_from_ledger"] is True
+    assert joiner["population"] == gen1["population"]
+    assert joiner["innovation_tracker"] == gen1["innovation_tracker"]
